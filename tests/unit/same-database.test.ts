@@ -9,9 +9,13 @@ describe('isSameDatabase', () => {
   it('differs on port with no identity', () => expect(isSameDatabase(a, { ...a, port: 5433 })).toBe(false));
   it('differs on database name with matching identity', () => expect(isSameDatabase(
     { ...a, serverIdentity: 'u1' }, { ...a, database: 'y', serverIdentity: 'u1' })).toBe(false));
-  it('differs on host and port with no identity', () => expect(isSameDatabase(a, { ...a, host: 'dev' })).toBe(false));
-  it('differs when identities differ even on the same host and port', () => expect(isSameDatabase(
-    { ...a, serverIdentity: 'u1' }, { ...a, serverIdentity: 'u2' })).toBe(false));
+  it('differs when only the host differs and there is no identity', () => expect(isSameDatabase(a, { ...a, host: 'dev' })).toBe(false));
+  it('still matches on host and port when identities differ', () => expect(isSameDatabase(
+    { ...a, serverIdentity: 'u1' }, { ...a, serverIdentity: 'u2' })).toBe(true));
+  it('differs when identities differ on different hosts', () => expect(isSameDatabase(
+    { ...a, host: 'dev', serverIdentity: 'u1' }, { ...a, serverIdentity: 'u2' })).toBe(false));
+  it.each(['LOCALHOST', ' localhost ', '[::1]', '127.0.0.1', '127.5.5.5'])('normalises loopback host %j', (h) =>
+    expect(isSameDatabase(a, { ...a, host: h })).toBe(true));
   it('falls back to host and port when only one side has an identity', () => expect(isSameDatabase(
     { ...a, serverIdentity: 'u1' }, a)).toBe(true));
 });

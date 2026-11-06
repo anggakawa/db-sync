@@ -12,6 +12,6 @@ function normalizeHost(host: string): string {
 
 export function isSameDatabase(a: DatabaseIdentity, b: DatabaseIdentity): boolean {
   if (a.database !== b.database) return false;
-  if (a.serverIdentity !== null && b.serverIdentity !== null) return a.serverIdentity === b.serverIdentity;
+  if (a.serverIdentity !== null && a.serverIdentity === b.serverIdentity) return true;
   return normalizeHost(a.host) === normalizeHost(b.host) && a.port === b.port;
 }
