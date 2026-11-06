@@ -17,7 +17,9 @@ export interface ProfileStore {
 // On disk, every password is already passed through the cipher ('' stays '').
 interface FileData { profiles: Profile[]; results: Record<string, SyncOutcome> }
 
-function validEndpoint(label: string, e: { port: number; database: string }): void {
+function validEndpoint(label: string, e: { host: string; user: string; port: number; database: string }): void {
+  if (!e.host || !e.host.trim()) throw new Error(`${label} host is required`);
+  if (!e.user || !e.user.trim()) throw new Error(`${label} user is required`);
   if (!e.database || !e.database.trim()) throw new Error(`${label} database is required`);
   if (!Number.isInteger(e.port) || e.port < 1 || e.port > 65535) throw new Error(`${label} port must be between 1 and 65535`);
 }

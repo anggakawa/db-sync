@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { conninfoDbname, dumpArgs, missingExtensions, restoreArgs, toolEnv } from '../../src/main/engines/postgres/args';
+import { createPostgresAdapter } from '../../src/main/engines/postgres/postgres-adapter';
 import type { Endpoint } from '../../src/shared/types';
 
 const ep: Endpoint = { host: 'db.example.com', port: 5433, user: 'me', password: 's3cret-pw', database: 'app' };
@@ -40,5 +41,18 @@ describe('postgres args', () => {
   it('names extensions the target lacks', () => {
     expect(missingExtensions(['plpgsql', 'pgcrypto', 'postgis'], ['pgcrypto'])).toEqual(['postgis']);
     expect(missingExtensions(['plpgsql'], [])).toEqual([]);
+  });
+});
+
+describe('blank connection values', () => {
+  const adapter = createPostgresAdapter({ locate: { path: () => 'unused', pluginDir: () => null }, tmpRoot: 'unused' });
+  it.each([
+    ['host', { host: '  ' }, /host/i],
+    ['user', { user: '' }, /user/i],
+    ['database', { database: ' ' }, /database/i],
+  ])('refuses a blank %s before connecting', async (_label, over, message) => {
+    // A blank host would silently become localhost inside the driver.
+    await expect(adapter.openTarget({ ...ep, ...over })).rejects.toThrow(message);
+    await expect(adapter.openSource({ ...ep, ...over, ssl: false })).rejects.toThrow(message);
   });
 });

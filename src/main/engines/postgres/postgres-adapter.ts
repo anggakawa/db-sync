@@ -1,5 +1,5 @@
 import { promises as fs } from 'node:fs';
-import { Client, type ClientConfig } from 'pg';
+import type { Client } from 'pg';
 import type { CheckIssue, Endpoint, SourceEndpoint } from '../../../shared/types';
 import { runTool } from '../../process/process-runner';
 import type { ToolLocator } from '../../tools/tool-locator';
@@ -8,8 +8,10 @@ import {
   type TargetDatabase,
 } from '../adapter';
 import { dumpArgs, missingExtensions, restoreArgs, toolEnv } from './args';
+import { connect, DDL_TIMEOUT_MS, endQuietly, guardedQuery as q, requireEndpoint } from './connection';
 
 const OBJECT_IN_USE = '55006';
+const INSUFFICIENT_PRIVILEGE = '42501';
 const DUMP_LINE = /dumping contents of table/;
 const RESTORE_LINE = /processing data for table/;
 
@@ -17,60 +19,38 @@ const RESTORE_LINE = /processing data for table/;
 interface PostgresSource extends SourceDatabase { extensionNames(): Promise<string[]> }
 interface PostgresTarget extends TargetDatabase { availableExtensions(): Promise<string[]> }
 
-/** `pg` reads PG* variables (PGOPTIONS, PGPASSWORD...) when a client is constructed, so build it without them. */
-function newClientWithoutPgEnv(config: ClientConfig): Client {
-  const saved = Object.entries(process.env).filter(([key]) => /^PG/i.test(key));
-  for (const [key] of saved) delete process.env[key];
-  try {
-    return new Client(config);
-  } finally {
-    for (const [key, value] of saved) process.env[key] = value;
-  }
-}
-
-async function connect(ep: Endpoint, database: string, ssl: boolean): Promise<Client> {
-  const client = newClientWithoutPgEnv({
-    host: ep.host, port: ep.port, user: ep.user, database,
-    // A function, so an empty password is never looked up in a password file.
-    password: () => ep.password,
-    ssl: ssl ? { rejectUnauthorized: false } : false,
-    application_name: 'DB Sync',
-    client_encoding: 'UTF8',
-    connectionTimeoutMillis: 20_000,
-  });
-  // A dropped connection must not crash the app; the next query reports it.
-  client.on('error', () => undefined);
-  await client.connect();
-  return client;
-}
-
-async function endQuietly(client: Client | undefined): Promise<void> {
-  try { await client?.end(); } catch { /* already gone */ }
-}
-
 async function readInfo(client: Client): Promise<ServerInfo> {
-  const { rows } = await client.query<{ num: string }>(`SELECT current_setting('server_version_num') AS num`);
+  const { rows } = await q<{ num: string }>(client, `SELECT current_setting('server_version_num') AS num`);
   const major = Math.floor(Number(rows[0].num) / 10000);
   let identity: string | null = null;
   try {
-    const res = await client.query<{ id: string }>('SELECT system_identifier::text AS id FROM pg_control_system()');
+    const res = await q<{ id: string }>(client, 'SELECT system_identifier::text AS id FROM pg_control_system()');
     identity = res.rows[0]?.id ?? null;
   } catch { /* no permission */ }
   return { flavor: 'postgres', version: [major, 0], versionLabel: String(major), identity };
 }
 
 async function readTables(client: Client): Promise<string[]> {
-  const { rows } = await client.query<{ name: string }>(
+  // Other sessions' temporary tables are not part of the database's contents.
+  const { rows } = await q<{ name: string }>(
+    client,
     `SELECT schemaname || '.' || tablename AS name FROM pg_tables
-      WHERE schemaname NOT IN ('pg_catalog', 'information_schema')`,
+      WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+        AND schemaname !~ '^pg_(toast_)?temp_'`,
   );
   // Sorted here, not by the server, so two servers with different collations agree.
   return rows.map((r) => r.name).sort();
 }
 
+async function readSize(client: Client): Promise<number> {
+  const { rows } = await q<{ size: string }>(client, 'SELECT pg_database_size(current_database())::text AS size');
+  return Number(rows[0].size);
+}
+
 /** The encoding of the connected database, or of the named one. */
 async function readCreateOptions(client: Client, database?: string): Promise<CreateOptions> {
-  const { rows } = await client.query<{ encoding: string }>(
+  const { rows } = await q<{ encoding: string }>(
+    client,
     `SELECT pg_encoding_to_char(encoding) AS encoding FROM pg_database
       WHERE datname = ${database === undefined ? 'current_database()' : '$1'}`,
     database === undefined ? [] : [database],
@@ -91,6 +71,8 @@ function progressLines(pattern: RegExp, total: number, label: string, ctx: StepC
 
 export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: string }): EngineAdapter {
   async function runDump(ep: Endpoint, ssl: boolean | undefined, dest: string, total: number, label: string, ctx: StepContext) {
+    // pg_dump -Fd needs a missing or empty folder; a crash can leave one behind.
+    await fs.rm(dest, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     await runTool({
       command: deps.locate.path('postgres', 'dump'),
       args: dumpArgs(ep, dest),
@@ -103,19 +85,17 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
 
   return {
     async openSource(endpoint: SourceEndpoint): Promise<SourceDatabase> {
+      requireEndpoint(endpoint);
       const client = await connect(endpoint, endpoint.database, endpoint.ssl);
       const source: PostgresSource = {
         kind: 'source',
         info: () => readInfo(client),
         // Read-only queries only: nothing on a source ever writes.
-        async sizeBytes() {
-          const { rows } = await client.query<{ size: string }>('SELECT pg_database_size(current_database())::text AS size');
-          return Number(rows[0].size);
-        },
+        sizeBytes: () => readSize(client),
         listTables: () => readTables(client),
         createOptions: () => readCreateOptions(client),
         async extensionNames() {
-          const { rows } = await client.query<{ extname: string }>('SELECT extname FROM pg_extension');
+          const { rows } = await q<{ extname: string }>(client, 'SELECT extname FROM pg_extension');
           return rows.map((r) => r.extname);
         },
         async dump(destPath, ctx) {
@@ -128,12 +108,13 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
     },
 
     async openTarget(endpoint: Endpoint): Promise<TargetDatabase> {
+      requireEndpoint(endpoint);
       // The target database may not exist yet, so the connection goes to a maintenance database.
       const client = await connect(endpoint, endpoint.database === 'postgres' ? 'template1' : 'postgres', false);
       const name = endpoint.database;
 
       const exists = async (): Promise<boolean> => {
-        const { rowCount } = await client.query('SELECT 1 FROM pg_database WHERE datname = $1', [name]);
+        const { rowCount } = await q(client, 'SELECT 1 FROM pg_database WHERE datname = $1', [name]);
         return (rowCount ?? 0) > 0;
       };
       /** Runs `fn` on a short connection to the target database itself. */
@@ -142,12 +123,18 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
         try { return await fn(direct); } finally { await endQuietly(direct); }
       };
       const otherClients = async (): Promise<string[]> => {
-        const { rows } = await client.query<{ app: string }>(
-          `SELECT DISTINCT application_name AS app FROM pg_stat_activity
-            WHERE datname = $1 AND pid <> pg_backend_pid() ORDER BY 1`,
-          [name],
-        );
-        return rows.map((r) => r.app || '(unnamed program)');
+        try {
+          const { rows } = await q<{ app: string }>(
+            client,
+            `SELECT DISTINCT application_name AS app FROM pg_stat_activity
+              WHERE datname = $1 AND pid <> pg_backend_pid() ORDER BY 1`,
+            [name],
+          );
+          const names = rows.map((r) => r.app || '(unnamed program)');
+          return names.length > 0 ? names : ['(unknown program)'];
+        } catch {
+          return ['(unknown program)'];
+        }
       };
 
       const target: PostgresTarget = {
@@ -156,10 +143,7 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
         exists,
         async sizeBytes() {
           if (!(await exists())) return 0;
-          return inTarget(async (c) => {
-            const { rows } = await c.query<{ size: string }>('SELECT pg_database_size(current_database())::text AS size');
-            return Number(rows[0].size);
-          });
+          return inTarget(readSize);
         },
         async listTables() {
           if (!(await exists())) return [];
@@ -169,36 +153,48 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
           return readCreateOptions(client, name);
         },
         async availableExtensions() {
-          const { rows } = await client.query<{ name: string }>('SELECT name FROM pg_available_extensions');
+          const { rows } = await q<{ name: string }>(client, 'SELECT name FROM pg_available_extensions');
           return rows.map((r) => r.name);
         },
         async canCreateDatabase() {
-          const { rows } = await client.query<{ ok: boolean }>(
-            'SELECT rolcreatedb OR rolsuper AS ok FROM pg_roles WHERE rolname = current_user',
+          const { rows } = await q<{ ok: boolean }>(
+            client, 'SELECT rolcreatedb OR rolsuper AS ok FROM pg_roles WHERE rolname = current_user',
           );
           return rows[0]?.ok === true;
         },
-        async dropDatabase(_ctx) {
-          if (!(await exists())) return;
+        async dropDatabase(ctx) {
+          const { signal } = ctx;
+          const meta = { signal };
+          if (!(await q(client, 'SELECT 1 FROM pg_database WHERE datname = $1', [name], meta)).rowCount) return;
           try {
-            await client.query(
+            await q(
+              client,
               'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()',
-              [name],
+              [name], meta,
             );
-          } catch { /* a session we may not end; the drop below reports it */ }
-          const { rows } = await client.query<{ num: string }>(`SELECT current_setting('server_version_num') AS num`);
+          } catch (err) {
+            if (signal.aborted) throw err;
+            /* a session we may not end; the drop below reports it */
+          }
+          const { rows } = await q<{ num: string }>(client, `SELECT current_setting('server_version_num') AS num`, [], meta);
           const force = Number(rows[0].num) >= 130000 ? ' WITH (FORCE)' : '';
           try {
             // The only database this ever drops is the profile's own target.
-            await client.query(`DROP DATABASE IF EXISTS ${client.escapeIdentifier(name)}${force}`);
+            await q(client, `DROP DATABASE IF EXISTS ${client.escapeIdentifier(name)}${force}`, [], { signal, timeoutMs: DDL_TIMEOUT_MS });
           } catch (err) {
-            if ((err as { code?: string }).code === OBJECT_IN_USE) throw new DropBlockedError(await otherClients());
+            // 55006: a session is still connected. 42501: FORCE could not end another role's session, or the role does not
+            // own the database. Either way the drop was refused and nothing was deleted.
+            const code = (err as { code?: string }).code;
+            if (code === OBJECT_IN_USE || code === INSUFFICIENT_PRIVILEGE) throw new DropBlockedError(await otherClients());
             throw err;
           }
         },
         async createDatabase(options) {
           const encoding = options.encoding ? ` ENCODING ${client.escapeLiteral(options.encoding)}` : '';
-          await client.query(`CREATE DATABASE ${client.escapeIdentifier(name)} TEMPLATE template0${encoding}`);
+          await q(
+            client, `CREATE DATABASE ${client.escapeIdentifier(name)} TEMPLATE template0${encoding}`, [],
+            { timeoutMs: DDL_TIMEOUT_MS },
+          );
         },
         async dump(destPath, ctx) {
           const total = (await target.listTables()).length;

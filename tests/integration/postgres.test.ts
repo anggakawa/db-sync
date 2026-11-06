@@ -3,12 +3,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { connect, guardedQuery } from '../../src/main/engines/postgres/connection';
 import { createPostgresAdapter } from '../../src/main/engines/postgres/postgres-adapter';
-import type { EngineAdapter, StepContext } from '../../src/main/engines/adapter';
+import { DropBlockedError, type EngineAdapter, type StepContext } from '../../src/main/engines/adapter';
 import { writeJournal } from '../../src/main/sync/journal';
 import { createToolLocator } from '../../src/main/tools/tool-locator';
-import type { Endpoint, Profile } from '../../src/shared/types';
-import { BUNDLED_TOOLS, startTempServer, type TempServer } from './harness/temp-server';
+import type { Endpoint, Profile, SyncEvent } from '../../src/shared/types';
+import { BUNDLED_TOOLS, startTempServers, type TempServer } from './harness/temp-server';
 import { createTestRunner, runSyncForTest } from './harness/sync-fixture';
 
 vi.setConfig({ testTimeout: 180_000, hookTimeout: 300_000 });
@@ -61,6 +62,11 @@ const profileFor = (
   };
 };
 const ctx = (): StepContext => ({ signal: new AbortController().signal, onLog: () => undefined, onProgress: () => undefined });
+/** Compares the raw text of every event, not a JSON encoding that would escape quotes and backslashes. */
+const expectNoSecret = (events: SyncEvent[], secret: string) => {
+  const raw = events.map((e) => (e.type === 'log' ? e.line : e.type === 'progress' ? e.label : e.step));
+  expect(raw.some((text) => text.includes(secret))).toBe(false);
+};
 const exists = (p: string) => fs.stat(p).then(() => true, () => false);
 
 /** Everything the fixture creates, in a form two databases can be compared by. */
@@ -81,9 +87,7 @@ async function snapshot(server: TempServer, database: string, password?: string)
 }
 
 beforeAll(async () => {
-  [source, local, trusting] = await Promise.all([
-    startTempServer('postgres'), startTempServer('postgres'), startTempServer('postgres', { emptyPassword: true }),
-  ]);
+  [source, local, trusting] = await startTempServers(['postgres'], ['postgres'], ['postgres', { emptyPassword: true }]);
   workDir = await fs.mkdtemp(join(tmpdir(), 'dbsync-it-'));
   rootDir = join(workDir, 'dá ta sync');
   adapter = createPostgresAdapter({
@@ -161,7 +165,7 @@ describe('PostgreSQL adapter', () => {
       const profile = profileFor(name, name, { srcPassword: WEIRD_PASSWORD, tgtPassword: WEIRD_PASSWORD });
       const { outcome, events } = await runSyncForTest(adapter, profile, rootDir);
       expect(outcome.status).toBe('success');
-      expect(JSON.stringify(events)).not.toContain(WEIRD_PASSWORD);
+      expectNoSecret(events, WEIRD_PASSWORD);
       const rows = await withClient(local, name, async (c) => (await c.query('SELECT id FROM t')).rows, WEIRD_PASSWORD);
       expect(rows).toEqual([{ id: 7 }]);
     } finally {
@@ -342,6 +346,108 @@ describe('contracts the sync runner relies on', () => {
       await t.close();
     }
     expect(await databases(local)).toEqual(before.filter((d) => d !== 'drop_me'));
+  });
+});
+
+describe('limits and refusals', () => {
+  it('reports a drop the role may not do as blocked, deletes nothing and leaves the target untouched', async () => {
+    await withClient(local, 'postgres', (c) => c.query(`CREATE ROLE limited LOGIN CREATEDB PASSWORD 'limited-pw'`));
+    const limitedServer: TempServer = { ...local, user: 'limited', password: 'limited-pw' };
+    await createDb(local, 'guarded_t', 'CREATE TABLE keep (id int); INSERT INTO keep VALUES (1), (2);');
+    const squatter = await connectTo(local, 'guarded_t'); // another role's session the limited role cannot end
+    await squatter.query('SELECT 1');
+
+    // What the server really answers to the limited role.
+    const limited = await connectTo(limitedServer, 'postgres');
+    const refused = await limited.query('DROP DATABASE guarded_t WITH (FORCE)').catch((e: unknown) => e as { code?: string });
+    expect((refused as { code?: string }).code).toBe('42501');
+
+    const t = await adapter.openTarget(endpoint(limitedServer, 'guarded_t'));
+    try {
+      await expect(t.dropDatabase(ctx())).rejects.toBeInstanceOf(DropBlockedError);
+    } finally {
+      await t.close();
+    }
+
+    const profile = profileFor('dev_app', 'guarded_t', { backupEnabled: false });
+    profile.target = endpoint(limitedServer, 'guarded_t');
+    const { outcome } = await runSyncForTest(adapter, profile, rootDir);
+    expect(outcome).toMatchObject({ status: 'failed', step: 'replace', targetState: 'untouched' });
+    await withClient(local, 'guarded_t', async (c) => {
+      expect((await c.query('SELECT id FROM keep ORDER BY id')).rows).toEqual([{ id: 1 }, { id: 2 }]);
+    });
+    await squatter.query('SELECT 1'); // still connected
+  });
+
+  it('does not drop when the signal is already aborted', async () => {
+    await createDb(local, 'abort_drop_t');
+    const t = await adapter.openTarget(endpoint(local, 'abort_drop_t'));
+    try {
+      const ac = new AbortController();
+      ac.abort();
+      await expect(t.dropDatabase({ ...ctx(), signal: ac.signal })).rejects.toThrow(/cancel/i);
+    } finally {
+      await t.close();
+    }
+    expect(await dbExists(local, 'abort_drop_t')).toBe(true);
+  });
+
+  it('stops a slow query when the signal aborts', async () => {
+    const client = await connect(endpoint(local, 'postgres'), 'postgres', false);
+    clients.push(client);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 300);
+    const started = Date.now();
+    await expect(guardedQuery(client, 'SELECT pg_sleep(60)', [], { signal: ac.signal })).rejects.toThrow(/cancel/i);
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
+
+  it('gives up on a slow query at the deadline', async () => {
+    const client = await connect(endpoint(local, 'postgres'), 'postgres', false);
+    clients.push(client);
+    const started = Date.now();
+    await expect(guardedQuery(client, 'SELECT pg_sleep(60)', [], { timeoutMs: 300 })).rejects.toThrow(/did not answer/);
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
+
+  it('dumps into a folder that already has files in it', async () => {
+    const s = await adapter.openSource({ ...endpoint(source, 'dev_app'), ssl: false });
+    const dest = join(workDir, 'leftover.dump');
+    await fs.mkdir(dest, { recursive: true });
+    await fs.writeFile(join(dest, 'stale.txt'), 'left by a crash');
+    try {
+      await s.dump(dest, ctx());
+    } finally {
+      await s.close();
+    }
+    expect(await exists(join(dest, 'toc.dat'))).toBe(true);
+    expect(await exists(join(dest, 'stale.txt'))).toBe(false);
+  });
+
+  it("does not list another session's temporary tables", async () => {
+    const holder = await connectTo(source, 'dev_app');
+    await holder.query('CREATE TEMP TABLE tmp_probe (id int)');
+    const seenRaw = await withClient(source, 'dev_app', async (c) =>
+      (await c.query(`SELECT count(*)::int AS n FROM pg_tables WHERE tablename = 'tmp_probe'`)).rows[0].n);
+    expect(seenRaw).toBe(1); // the server does show it, so the filter is what hides it
+    const s = await adapter.openSource({ ...endpoint(source, 'dev_app'), ssl: false });
+    try {
+      const tables = await s.listTables();
+      expect(tables.filter((t) => /tmp_probe|pg_temp/.test(t))).toEqual([]);
+      expect(tables).toContain('public.customers');
+    } finally {
+      await s.close();
+    }
+    await holder.end();
+  });
+
+  it('keeps passwords out of the events and failure text of a failed sync', async () => {
+    const profile = profileFor('dev_app', 'wrong_pw_t', { srcPassword: WEIRD_PASSWORD });
+    const { outcome, events } = await runSyncForTest(adapter, profile, rootDir);
+    expect(outcome.status).toBe('failed');
+    const text = outcome.status === 'failed' ? [outcome.message, outcome.details] : [];
+    expect(text.some((t) => t.includes(WEIRD_PASSWORD))).toBe(false);
+    expectNoSecret(events, WEIRD_PASSWORD);
   });
 });
 

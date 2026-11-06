@@ -149,6 +149,10 @@ describe('profile store', () => {
     ['empty name', (i: ProfileInput) => { i.name = '  '; }],
     ['empty source database', (i: ProfileInput) => { i.source.database = ''; }],
     ['empty target database', (i: ProfileInput) => { i.target.database = ''; }],
+    ['blank source host', (i: ProfileInput) => { i.source.host = '  '; }],
+    ['blank target host', (i: ProfileInput) => { i.target.host = ''; }],
+    ['blank source user', (i: ProfileInput) => { i.source.user = ' '; }],
+    ['blank target user', (i: ProfileInput) => { i.target.user = ''; }],
     ['port 0', (i: ProfileInput) => { i.source.port = 0; }],
     ['port 70000', (i: ProfileInput) => { i.target.port = 70000; }]
   ])('rejects invalid input: %s', async (_label, mutate) => {

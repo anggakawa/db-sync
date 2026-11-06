@@ -44,6 +44,14 @@ function run(exe: string, args: string[], timeoutMs: number): Promise<void> {
   });
 }
 
+/** Kills a postmaster that pg_ctl could not stop, found through its own pid file in the temp data folder. */
+async function killPostmaster(data: string): Promise<void> {
+  const text = await fs.readFile(join(data, 'postmaster.pid'), 'utf8').catch(() => '');
+  const pid = Number(text.split(/\r?\n/)[0]);
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  await run('taskkill', ['/PID', String(pid), '/T', '/F'], 30_000).catch(() => undefined);
+}
+
 async function startPostgres(name: 'postgres' | 'postgres-old', emptyPassword: boolean): Promise<TempServer> {
   const bin = join(REPO_ROOT, '.cache', 'servers', name, 'bin');
   const dir = await fs.mkdtemp(join(tmpdir(), `dbsync-${name}-`));
@@ -59,6 +67,7 @@ async function startPostgres(name: 'postgres' | 'postgres-old', emptyPassword: b
       started = false;
       await run(join(bin, 'pg_ctl.exe'), ['stop', '-D', data, '-m', 'immediate', '-w'], 60_000).catch(() => undefined);
     }
+    await killPostmaster(data);
     await fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   };
 
@@ -72,11 +81,14 @@ async function startPostgres(name: 'postgres' | 'postgres-old', emptyPassword: b
     }
     try { await run(join(bin, 'initdb.exe'), init, 120_000); } finally { await fs.rm(pwfile, { force: true }); }
     const options = `-p ${port} -h 127.0.0.1 -c fsync=off -c synchronous_commit=off -c full_page_writes=off`;
-    await run(join(bin, 'pg_ctl.exe'), ['start', '-D', data, '-l', join(dir, 'server.log'), '-w', '-t', '60', '-o', options], 90_000);
+    // Even a start that times out may have left a postmaster running, so stop() must try.
     started = true;
+    await run(join(bin, 'pg_ctl.exe'), ['start', '-D', data, '-l', join(dir, 'server.log'), '-w', '-t', '60', '-o', options], 90_000);
   } catch (err) {
+    const log = await fs.readFile(join(dir, 'server.log'), 'utf8').catch(() => '');
     await stop();
-    throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`${message}\n--- server.log ---\n${log.slice(-4000)}`);
   }
   return { host: '127.0.0.1', port, user, password, stop };
 }
@@ -85,4 +97,16 @@ async function startPostgres(name: 'postgres' | 'postgres-old', emptyPassword: b
 export async function startTempServer(name: ServerName, options: { emptyPassword?: boolean } = {}): Promise<TempServer> {
   if (name === 'postgres' || name === 'postgres-old') return startPostgres(name, options.emptyPassword ?? false);
   throw new Error(`Temp ${name} servers are not available yet.`);
+}
+
+/** Starts several servers; if any fails, the ones that did start are stopped before the error is thrown. */
+export async function startTempServers(...specs: Array<[ServerName, { emptyPassword?: boolean }?]>): Promise<TempServer[]> {
+  const results = await Promise.allSettled(specs.map(([name, options]) => startTempServer(name, options)));
+  const started = results.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []));
+  const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+  if (failed) {
+    await Promise.all(started.map((s) => s.stop().catch(() => undefined)));
+    throw failed.reason;
+  }
+  return started;
 }
