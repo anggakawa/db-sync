@@ -32,12 +32,12 @@ type Header = 'none' | 'afterDelimiter' | 'afterViewStart';
  * (routine, trigger, event) or right after a view's CREATE ALGORITHM line may carry a definer. Decoded as latin1 so
  * every byte survives the round trip, including ones that are not valid UTF-8; the patterns only match ASCII.
  */
-function processLine(line: Buffer, header: Header, database: string): { out: Buffer; next: Header } {
+function processLine(line: Buffer, header: Header, databaseLatin1: string): { out: Buffer; next: Header } {
   const text = line.toString('latin1');
   let next: Header = 'none';
   // Only the dumped database's own name goes; a statement about another database is left as it is.
   let edited = text.replace(ALTER_DATABASE_NAMED, (whole, name: string, rest: string) =>
-    (name.replaceAll('``', '`') === database ? `ALTER DATABASE ${rest}` : whole));
+    (name.replaceAll('``', '`') === databaseLatin1 ? `ALTER DATABASE ${rest}` : whole));
   if (header === 'afterDelimiter') {
     if (SESSION_SETTING.test(text) || ALTER_DATABASE.test(text)) next = 'afterDelimiter';
     else if (line.includes(DEFINER_TEXT)) edited = edited.replace(ROUTINE, 'CREATE ').replace(TRIGGER_OR_EVENT, '$1');
@@ -69,6 +69,8 @@ export function createDefinerFilter(options: { database: string }): Transform {
   let insideInsert = false;
   let header: Header = 'none';
   let lastByte = -1; // the last byte of the current INSERT line, not counting a carriage return
+  // The name as a line shows it: the dump holds its UTF-8 bytes, and a line is decoded as latin1.
+  const databaseLatin1 = Buffer.from(options.database, 'utf8').toString('latin1');
 
   const noteTail = (segment: Buffer): void => {
     for (let i = segment.length - 1; i >= 0; i -= 1) {
@@ -111,7 +113,7 @@ export function createDefinerFilter(options: { database: string }): Transform {
       mode = 'other';
     }
     if (newline) {
-      const done = processLine(pending.length === 1 ? pending[0] : Buffer.concat(pending), header, options.database);
+      const done = processLine(pending.length === 1 ? pending[0] : Buffer.concat(pending), header, databaseLatin1);
       out.push(done.out);
       header = done.next;
       pending = [];
@@ -142,7 +144,7 @@ export function createDefinerFilter(options: { database: string }): Transform {
     },
     flush(callback: TransformCallback) {
       // A last line without a newline.
-      callback(null, pending.length > 0 ? processLine(Buffer.concat(pending), header, options.database).out : undefined);
+      callback(null, pending.length > 0 ? processLine(Buffer.concat(pending), header, databaseLatin1).out : undefined);
     },
   });
 }

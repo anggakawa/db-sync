@@ -85,6 +85,35 @@ describe('definer filter: object headers', () => {
     });
   });
 
+  // The filter decodes lines as latin1 to keep every byte, while the name in the dump is UTF-8.
+  describe('a non-ASCII database name', () => {
+    const line = (name: string) => `ALTER DATABASE \`${name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ;;`;
+    const rewritten = 'ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ;;';
+
+    it.each([
+      ['dév_src', line('dév_src')],
+      ['データ', line('データ')],
+      ['dé`v', line('dé``v')],
+    ])('is dropped when it is the dumped database %s', async (database, input) => {
+      expect(await filterText(`${D}${input}\n-- x\n`, Infinity, database)).toBe(`${D}${rewritten}\n-- x\n`);
+    });
+
+    it('is dropped when the bytes arrive one at a time, and on a last line with no newline', async () => {
+      expect(await filterText(`${D}${line('dév_src')}\r\n-- x\r\n`, 1, 'dév_src')).toBe(`${D}${rewritten}\r\n-- x\r\n`);
+      expect(await filterText(line('dév_src'), 1, 'dév_src')).toBe(rewritten);
+    });
+
+    it.each([
+      ['another non-ASCII name', 'dév_src', 'cible_é'],
+      ['a name differing only by an accent', 'dév_src', 'dèv_src'],
+      ['the name the dumped one looks like when misread as latin1', 'dÃ©v_src', 'dév_src'],
+    ])('leaves %s unchanged', async (_name, database, inLine) => {
+      const text = `${D}${line(inLine)}\n-- x\n`;
+      expect(await filterText(text, Infinity, database)).toBe(text);
+      expect(await filterText(text, 1, database)).toBe(text);
+    });
+  });
+
   it('leaves an ALTER DATABASE line that is not the dump\'s own shape, and one inside a row, unchanged', async () => {
     const text = "  ALTER DATABASE `app` CHARACTER SET utf8mb4 COLLATE x ;\nALTER DATABASE `app` SET something ;\nINSERT INTO t VALUES ('x');\n";
     expect(await filterText(text)).toBe(text);

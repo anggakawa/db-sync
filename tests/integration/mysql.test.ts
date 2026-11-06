@@ -1012,11 +1012,19 @@ port=${local.port}
     // The MariaDB tools handle all of these.
     describe.runIf(flavor === 'mariadb')('names and folders the MariaDB tools handle', () => {
       it('syncs with a non-ASCII source name, a non-ASCII target name and a Japanese data folder', async () => {
-        await createDb(source, 'dév_src', ['CREATE TABLE t (id INT)', 'INSERT INTO t VALUES (3)']);
+        // The collation changes after the event is created, so the dump names the source in ALTER DATABASE lines around the event.
+        await createDb(source, 'dév_src', [
+          'CREATE TABLE t (id INT)',
+          'INSERT INTO t VALUES (3)',
+          "CREATE EVENT before_change ON SCHEDULE EVERY 1 DAY STARTS '2035-01-01 00:00:00' DO SET @x = 1",
+          'ALTER DATABASE COLLATE utf8mb4_unicode_ci',
+        ]);
         await createDb(local, 'cible_é', ['CREATE TABLE old (id INT)']);
         const first = await runSyncForTest(adapter, profileFor('dév_src', 'cible_é'), rootDir);
         expect(first.outcome, JSON.stringify(first.outcome)).toMatchObject({ status: 'success' });
         expect(await select(local, 'cible_é', 'SELECT id FROM t')).toEqual([{ id: 3 }]);
+        expect(await select(local, 'cible_é', 'SELECT event_name AS n FROM information_schema.events WHERE event_schema = DATABASE()')).toEqual([{ n: 'before_change' }]);
+        expect(await select(local, 'cible_é', 'SELECT default_collation_name AS c FROM information_schema.schemata WHERE schema_name = DATABASE()')).toEqual([{ c: 'utf8mb4_unicode_ci' }]);
 
         const jaRoot = join(workDir, 'データ');
         const jaAdapter = createMysqlAdapter({ locate, tmpRoot: join(jaRoot, 'tmp') });
