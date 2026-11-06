@@ -174,6 +174,54 @@ describe('step 4 recovery', () => {
     expect(await readJournal(paths, profile.id)).toMatchObject({ profileId: 'p1', hadTarget: true, backupAvailable: true });
   });
 
+  /** Makes the first target connection unusable once its restore has failed, as a destroyed client would be. */
+  function killFirstTargetAfterRestore(fake: ReturnType<typeof createFakeAdapter>, opened: string[]) {
+    const open = fake.adapter.openTarget;
+    fake.adapter.openTarget = async (e) => {
+      const real = await open(e);
+      opened.push('target');
+      if (opened.length > 1) return { ...real };
+      let dead = false;
+      const wrapped = { ...real } as Record<string, unknown>;
+      for (const [key, fn] of Object.entries(real)) {
+        if (typeof fn !== 'function' || key === 'close') continue;
+        wrapped[key] = async (...args: unknown[]) => {
+          if (dead) throw new Error('Cannot enqueue Query after fatal error.');
+          try { return await (fn as (...a: unknown[]) => unknown)(...args); } catch (err) {
+            if (key === 'restore') dead = true;
+            throw err;
+          }
+        };
+      }
+      return wrapped as unknown as typeof real;
+    };
+  }
+
+  it('recovers through a fresh connection when the first one is unusable after the failed restore', async () => {
+    const { fake, runner, callbacks } = setup({ failuresOnce: { 'target.restore': new Error('boom') } });
+    const opened: string[] = [];
+    killFirstTargetAfterRestore(fake, opened);
+    const out = await runner.sync(profile, callbacks());
+    expect(out).toMatchObject({ status: 'failed', step: 'replace', targetState: 'restored-from-backup' });
+    expect(opened).toHaveLength(2);
+    expect(fake.closes.filter((c) => c === 'target')).toHaveLength(2); // the fresh one is closed again
+    expect(await readJournal(paths, profile.id)).toBeNull();
+  });
+
+  it('reports recovery-failed when the fresh connection cannot be opened', async () => {
+    const { fake, runner, callbacks } = setup({ failuresOnce: { 'target.restore': new Error('boom') } });
+    const open = fake.adapter.openTarget;
+    let n = 0;
+    fake.adapter.openTarget = async (e) => {
+      if (++n > 1) throw new Error('connect ECONNREFUSED');
+      return open(e);
+    };
+    const out = await runner.sync(profile, callbacks());
+    expect(out).toMatchObject({ status: 'failed', targetState: 'recovery-failed', backupPath: paths.backupLatest(profile.id) });
+    expect(out.status === 'failed' && out.details).toContain('ECONNREFUSED');
+    expect(await readJournal(paths, profile.id)).not.toBeNull();
+  });
+
   it('checks the guard before recovery touches the target', async () => {
     let n = 0;
     const { fake, runner, callbacks } = setup(

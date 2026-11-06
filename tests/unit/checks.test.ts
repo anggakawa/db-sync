@@ -46,3 +46,22 @@ describe('runChecks', () => {
     expect(await issuesFor({})).toEqual([]);
   });
 });
+
+describe('same-database detection on servers that ignore case', () => {
+  const sameServer = { sourceInfo: pgInfo(16, 'one-server'), targetInfo: pgInfo(16, 'one-server') };
+  const mixed: Profile = {
+    ...profile,
+    source: { ...profile.source, database: 'MyDb' },
+    target: { ...profile.target, database: 'mydb' },
+  };
+
+  it('blocks MyDb and mydb on one server when the server folds names', async () => {
+    const issues = await issuesFor({ ...sameServer, foldDatabaseNames: true }, 1_000_000, mixed);
+    expect(issues.filter((i) => i.code === 'same-database')).toHaveLength(1);
+  });
+
+  it('keeps MyDb and mydb apart when the server is case-sensitive', async () => {
+    const issues = await issuesFor({ ...sameServer, foldDatabaseNames: false }, 1_000_000, mixed);
+    expect(issues.filter((i) => i.code === 'same-database')).toEqual([]);
+  });
+});

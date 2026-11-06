@@ -1,25 +1,9 @@
 import { Client, type ClientConfig, type QueryResultRow } from 'pg';
 import type { Endpoint } from '../../../shared/types';
 import { ToolCancelledError } from '../../process/process-runner';
+import { DDL_TIMEOUT_MS, END_TIMEOUT_MS, METADATA_TIMEOUT_MS, QueryTimeoutError, requireEndpoint } from '../limits';
 
-export const METADATA_TIMEOUT_MS = 60_000;
-export const DDL_TIMEOUT_MS = 5 * 60_000;
-const END_TIMEOUT_MS = 5_000;
-
-export class QueryTimeoutError extends Error {
-  constructor(seconds: number) {
-    super(`The database did not answer within ${seconds} seconds.`);
-    this.name = 'QueryTimeoutError';
-  }
-}
-
-/** A blank value would be replaced by a default (localhost, the OS user) inside the driver, so refuse it up front. */
-export function requireEndpoint(ep: Endpoint): void {
-  const blank = (v: unknown) => typeof v !== 'string' || v.trim() === '';
-  if (blank(ep.host)) throw new Error('The host is required.');
-  if (blank(ep.user)) throw new Error('The user is required.');
-  if (blank(ep.database)) throw new Error('The database name is required.');
-}
+export { DDL_TIMEOUT_MS, METADATA_TIMEOUT_MS, QueryTimeoutError, requireEndpoint };
 
 /** `pg` reads PG* variables (PGOPTIONS, PGPASSWORD...) when a client is constructed, so build it without them. */
 function newClientWithoutPgEnv(config: ClientConfig): Client {

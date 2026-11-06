@@ -94,6 +94,7 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
         sizeBytes: () => readSize(client),
         listTables: () => readTables(client),
         createOptions: () => readCreateOptions(client),
+        databaseKey: async () => endpoint.database,
         async extensionNames() {
           const { rows } = await q<{ extname: string }>(client, 'SELECT extname FROM pg_extension');
           return rows.map((r) => r.extname);
@@ -152,6 +153,7 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
         async createOptions() {
           return readCreateOptions(client, name);
         },
+        databaseKey: async () => name,
         async availableExtensions() {
           const { rows } = await q<{ name: string }>(client, 'SELECT name FROM pg_available_extensions');
           return rows.map((r) => r.name);

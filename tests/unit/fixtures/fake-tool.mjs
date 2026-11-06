@@ -6,6 +6,8 @@ const [mode, ...rest] = process.argv.slice(2);
 
 if (mode === 'echo') {
   process.stdout.write(JSON.stringify({ args: rest, env: process.env }));
+} else if (mode === 'cwd') {
+  process.stdout.write(process.cwd());
 } else if (mode === 'stderr') {
   // rest: text, exit code
   process.stderr.write(`${rest[0]}\n`);

@@ -52,6 +52,12 @@ describe('runTool', () => {
     expect(out.args).toEqual(['ok']);
   });
 
+  it('runs the tool in the folder it is given, even one with non-ASCII characters', async () => {
+    const dir = join(tmp, 'dá cwd');
+    mkdirSync(dir);
+    expect((await capture(base([fixture, 'cwd'], { cwd: dir }))).toLowerCase()).toBe(dir.toLowerCase());
+  });
+
   it('rejects with ToolError and a redacted 64 KB stderr tail on non-zero exit', async () => {
     const err = await runTool(base([fixture, 'bigerr', 'hunter2', '3'], { secrets: ['hunter2'] })).then(
       () => null,

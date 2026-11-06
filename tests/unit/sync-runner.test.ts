@@ -228,7 +228,7 @@ describe('sync runner', () => {
     const { fake, runner, events, callbacks } = setup({ failuresOnce: { 'target.restore': new Error('real error') } });
     const out = await runner.sync(profile, callbacks());
     expect(out).toMatchObject({ status: 'failed', step: 'replace', message: expect.stringContaining('real error') });
-    expect(fake.closes.sort()).toEqual(['source', 'target']);
+    expect(fake.closes.sort()).toEqual(['source', 'target', 'target']); // recovery used a second target connection
     expect(events.some((e) => e.type === 'log' && e.line.includes('busy'))).toBe(true);
   });
 

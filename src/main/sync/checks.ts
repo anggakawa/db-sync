@@ -19,10 +19,13 @@ export async function runChecks(
   const issues: CheckIssue[] = [];
   const s = await source.info();
   const t = await target.info();
+  // The server decides whether MyDb and mydb are the same database.
+  const sourceKey = await source.databaseKey();
+  const targetKey = await target.databaseKey();
 
   if (isSameDatabase(
-    { host: profile.source.host, port: profile.source.port, database: profile.source.database, serverIdentity: s.identity },
-    { host: profile.target.host, port: profile.target.port, database: profile.target.database, serverIdentity: t.identity },
+    { host: profile.source.host, port: profile.source.port, database: sourceKey, serverIdentity: s.identity },
+    { host: profile.target.host, port: profile.target.port, database: targetKey, serverIdentity: t.identity },
   )) {
     issues.push({ severity: 'blocker', code: 'same-database', message: 'The source and the target are the same database.' });
   }

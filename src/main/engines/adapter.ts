@@ -27,6 +27,8 @@ interface DatabaseReader {
   sizeBytes(): Promise<number>; // 0 when the database does not exist
   listTables(): Promise<string[]>; // sorted "schema.table" or "table"; [] when the database does not exist
   createOptions(): Promise<CreateOptions>;
+  /** The database name as the server compares it: folded to lower case when the server ignores case. */
+  databaseKey(): Promise<string>;
   dump(destPath: string, ctx: StepContext): Promise<void>;
   close(): Promise<void>;
 }

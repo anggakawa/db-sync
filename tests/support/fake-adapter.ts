@@ -19,6 +19,8 @@ export interface FakeConfig {
   sourceCreateOptions: CreateOptions;
   targetCreateOptions: CreateOptions;
   engineIssues: CheckIssue[];
+  /** databaseKey() lowercases the name, as MySQL does when lower_case_table_names is not 0. */
+  foldDatabaseNames: boolean;
   /** Methods that throw when called. */
   failures: Partial<Record<FakeMethod, Error>>;
   /** Methods that throw on their first call only. */
@@ -44,6 +46,7 @@ export function createFakeAdapter(overrides: Partial<FakeConfig> = {}) {
     sourceCreateOptions: { encoding: 'UTF8', collation: 'en_US' },
     targetCreateOptions: { encoding: 'LATIN1' },
     engineIssues: [],
+    foldDatabaseNames: false,
     failures: {},
     failuresOnce: {},
     hooks: {},
@@ -54,6 +57,8 @@ export function createFakeAdapter(overrides: Partial<FakeConfig> = {}) {
   const restoredPaths: string[] = [];
   const opens: string[] = [];
   const closes: string[] = [];
+  const names = { source: '', target: '' };
+  const keyOf = (name: string) => (config.foldDatabaseNames ? name.toLowerCase() : name);
 
   const step = async (name: FakeMethod, destPath?: string) => {
     calls.push(name);
@@ -69,6 +74,7 @@ export function createFakeAdapter(overrides: Partial<FakeConfig> = {}) {
     info: async () => config.sourceInfo,
     sizeBytes: async () => config.sourceSize,
     listTables: async () => config.sourceTables,
+    databaseKey: async () => keyOf(names.source),
     createOptions: async () => config.sourceCreateOptions,
     dump: async (dest: string, _ctx: StepContext) => step('source.dump', dest),
     close: async () => { closes.push('source'); },
@@ -78,6 +84,7 @@ export function createFakeAdapter(overrides: Partial<FakeConfig> = {}) {
     info: async () => config.targetInfo,
     sizeBytes: async () => (config.targetExists ? config.targetSize : 0),
     listTables: async () => (config.targetExists ? config.targetTables : []),
+    databaseKey: async () => keyOf(names.target),
     createOptions: async () => config.targetCreateOptions,
     dump: async (dest: string, _ctx: StepContext) => step('target.dump', dest),
     exists: async () => config.targetExists,
@@ -88,8 +95,8 @@ export function createFakeAdapter(overrides: Partial<FakeConfig> = {}) {
     close: async () => { closes.push('target'); },
   };
   const adapter: EngineAdapter = {
-    openSource: async (_e: SourceEndpoint) => { opens.push('source'); return source; },
-    openTarget: async (_e: Endpoint) => { opens.push('target'); return target; },
+    openSource: async (e: SourceEndpoint) => { opens.push('source'); names.source = e.database; return source; },
+    openTarget: async (e: Endpoint) => { opens.push('target'); names.target = e.database; return target; },
     engineChecks: async () => config.engineIssues,
   };
   return { adapter, config, calls, created, restoredPaths, opens, closes };

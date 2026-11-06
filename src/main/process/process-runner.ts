@@ -27,6 +27,8 @@ export interface ToolRun {
   command: string;
   args: string[];
   env?: Record<string, string>;
+  /** Working folder of the tool; the process's own when unset. */
+  cwd?: string;
   signal: AbortSignal;
   secrets: string[];
   stdin?: NodeJS.ReadableStream;
@@ -58,6 +60,7 @@ export function runTool(run: ToolRun): Promise<void> {
     const child = spawn(run.command, run.args, {
       shell: false,
       windowsHide: true,
+      cwd: run.cwd,
       env: { ...cleanEnv(process.env), ...run.env },
       stdio: [run.stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });

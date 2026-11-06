@@ -1,10 +1,11 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import mysql from 'mysql2/promise';
 import { cleanEnv } from '../../../src/main/process/redact';
 
 export type ServerName = 'postgres' | 'postgres-old' | 'mysql' | 'mariadb';
@@ -93,9 +94,97 @@ async function startPostgres(name: 'postgres' | 'postgres-old', emptyPassword: b
   return { host: '127.0.0.1', port, user, password, stop };
 }
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const sqlString = (value: string) => mysql.escape(value);
+
+/** Runs a console server (mysqld, mariadbd) that stays in the foreground. stdio is ignored. */
+function spawnDaemon(exe: string, args: string[]): { child: ChildProcess; exited: Promise<void> } {
+  const child = spawn(exe, args, { shell: false, windowsHide: true, stdio: 'ignore', env: cleanEnv(process.env) });
+  const exited = new Promise<void>((resolveExit) => {
+    child.once('exit', () => resolveExit());
+    child.once('error', () => resolveExit());
+  });
+  return { child, exited };
+}
+
+async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolean): Promise<TempServer> {
+  const bin = join(REPO_ROOT, '.cache', 'servers', name, 'bin');
+  const dir = await fs.mkdtemp(join(tmpdir(), `dbsync-${name}-`));
+  const data = join(dir, 'data');
+  const user = 'sync_test';
+  const password = emptyPassword ? '' : randomBytes(12).toString('hex');
+  const rootPassword = randomBytes(12).toString('hex');
+  const port = await freePort();
+  const mysqld = join(bin, name === 'mysql' ? 'mysqld.exe' : 'mariadbd.exe');
+  let daemon: ReturnType<typeof spawnDaemon> | undefined;
+
+  const rootConnection = () => mysql.createConnection({ host: '127.0.0.1', port, user: 'root', password: rootPassword });
+
+  const stop = async (): Promise<void> => {
+    if (daemon) {
+      const { child, exited } = daemon;
+      daemon = undefined;
+      try {
+        const root = await rootConnection();
+        await root.query('SHUTDOWN').catch(() => undefined);
+        root.destroy();
+      } catch { /* not reachable: fall through to the kill */ }
+      const gone = await Promise.race([exited.then(() => true), sleep(30_000).then(() => false)]);
+      if (!gone && child.pid !== undefined) await run('taskkill', ['/PID', String(child.pid), '/T', '/F'], 30_000).catch(() => undefined);
+      await Promise.race([exited, sleep(10_000)]);
+    }
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  };
+
+  try {
+    await fs.mkdir(dir, { recursive: true });
+    // Every option the server runs with is explicit, and none of it listens beyond loopback.
+    const common = [
+      `--datadir=${data}`, `--port=${port}`, '--bind-address=127.0.0.1', `--log-error=${join(dir, 'server.log')}`,
+    ];
+    if (name === 'mysql') {
+      await run(mysqld, ['--initialize-insecure', `--datadir=${data}`, `--log-error=${join(dir, 'init.log')}`], 180_000);
+    } else {
+      await run(join(bin, 'mariadb-install-db.exe'), [`--datadir=${data}`, `--port=${port}`, `--password=${rootPassword}`, '--silent'], 180_000);
+    }
+    const fast = ['--innodb-buffer-pool-size=64M', '--innodb-flush-log-at-trx-commit=0', '--max-connections=60'];
+    const extra = name === 'mysql' ? ['--mysqlx=OFF', '--disable-log-bin'] : ['--skip-log-bin'];
+    daemon = spawnDaemon(mysqld, [...common, ...fast, ...extra]);
+
+    const deadline = Date.now() + 90_000;
+    const initialRootPassword = name === 'mysql' ? '' : rootPassword;
+    let root: mysql.Connection | undefined;
+    while (!root) {
+      if (Date.now() > deadline) throw new Error(`${name} did not accept connections`);
+      let died = false;
+      void daemon.exited.then(() => { died = true; });
+      try {
+        root = await mysql.createConnection({ host: '127.0.0.1', port, user: 'root', password: initialRootPassword, connectTimeout: 3_000 });
+      } catch {
+        await sleep(300);
+        if (died) throw new Error(`${name} exited during startup`);
+      }
+    }
+    try {
+      if (name === 'mysql') await root.query(`ALTER USER 'root'@'localhost' IDENTIFIED BY ${sqlString(rootPassword)}`);
+      await root.query(`CREATE USER ${sqlString(user)}@'%' IDENTIFIED BY ${sqlString(password)}`);
+      await root.query(`GRANT ALL PRIVILEGES ON *.* TO ${sqlString(user)}@'%' WITH GRANT OPTION`);
+    } finally {
+      root.destroy();
+    }
+  } catch (err) {
+    const log = await fs.readFile(join(dir, 'server.log'), 'utf8').catch(() => '');
+    await stop();
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`${message}\n--- server.log ---\n${log.slice(-4000)}`);
+  }
+  return { host: '127.0.0.1', port, user, password, stop };
+}
+
 /** Starts a throwaway server bound to 127.0.0.1 on an OS-chosen port. Always call stop() in afterAll. */
 export async function startTempServer(name: ServerName, options: { emptyPassword?: boolean } = {}): Promise<TempServer> {
   if (name === 'postgres' || name === 'postgres-old') return startPostgres(name, options.emptyPassword ?? false);
+  if (name === 'mysql' || name === 'mariadb') return startMysqlFamily(name, options.emptyPassword ?? false);
   throw new Error(`Temp ${name} servers are not available yet.`);
 }
 

@@ -238,9 +238,14 @@ export function createSyncRunner(deps: RunnerDeps) {
       let targetState: TargetState = touched || blockedPending ? 'maybe-incomplete' : 'untouched';
       if (touched && !restored && target && journal) {
         // Recovery must run to completion, so it gets its own signal rather than the cancelled one.
+        let fresh: TargetDatabase | undefined;
         try {
-          if (recoveryTouchesTarget(journal)) await ensureLocal(profile.target.host);
-          const rec = await recoverTarget(target, journal, paths, contextFor(cb, new AbortController().signal));
+          // The connection used so far may be destroyed or stale, so recovery gets its own.
+          if (recoveryTouchesTarget(journal)) {
+            await ensureLocal(profile.target.host);
+            fresh = await deps.adapterFor(profile.engine).openTarget(profile.target);
+          }
+          const rec = await recoverTarget(fresh ?? target, journal, paths, contextFor(cb, new AbortController().signal));
           targetState = rec.targetState;
           // Only a known good target clears the journal; maybe-incomplete keeps it.
           if (rec.targetState !== 'maybe-incomplete') await clearJournalQuietly(id, ctx.onLog);
@@ -250,6 +255,8 @@ export function createSyncRunner(deps: RunnerDeps) {
             message: recoveryFailedMessage(causeOf(recErr), journal.backupAvailable ? paths.backupLatest(id) : undefined, !journal.backupAvailable && !journal.hadTarget),
             details: `${failure?.details ?? 'The sync was cancelled.'}\n\nRecovery failed: ${errText(recErr)}`,
           };
+        } finally {
+          await closeAll([fresh], ctx.onLog);
         }
       }
       if (cancelled) return { status: 'cancelled', targetState, ...keep };
