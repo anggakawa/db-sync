@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import mysql from 'mysql2/promise';
 import { cleanEnv } from '../../../src/main/process/redact';
 
-export type ServerName = 'postgres' | 'postgres-old' | 'mysql' | 'mariadb';
+export type ServerName = 'postgres' | 'postgres-old' | 'mysql' | 'mysql-old' | 'mariadb' | 'mariadb-old';
 export interface TempServer {
   host: '127.0.0.1';
   port: number;
@@ -107,7 +107,7 @@ function spawnDaemon(exe: string, args: string[]): { child: ChildProcess; exited
   return { child, exited };
 }
 
-async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolean, noTls: boolean): Promise<TempServer> {
+async function startMysqlFamily(name: 'mysql' | 'mysql-old' | 'mariadb' | 'mariadb-old', emptyPassword: boolean, noTls: boolean): Promise<TempServer> {
   const bin = join(REPO_ROOT, '.cache', 'servers', name, 'bin');
   const dir = await fs.mkdtemp(join(tmpdir(), `dbsync-${name}-`));
   const data = join(dir, 'data');
@@ -115,7 +115,9 @@ async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolea
   const password = emptyPassword ? '' : randomBytes(12).toString('hex');
   const rootPassword = randomBytes(12).toString('hex');
   const port = await freePort();
-  const mysqld = join(bin, name === 'mysql' ? 'mysqld.exe' : 'mariadbd.exe');
+  // The -old servers are the previous LTS lines (MySQL 8.0, MariaDB 10.11) and start the same way as the current ones.
+  const isMysql = name === 'mysql' || name === 'mysql-old';
+  const mysqld = join(bin, isMysql ? 'mysqld.exe' : 'mariadbd.exe');
   let daemon: ReturnType<typeof spawnDaemon> | undefined;
 
   const rootConnection = () => mysql.createConnection({ host: '127.0.0.1', port, user: 'root', password: rootPassword });
@@ -145,7 +147,7 @@ async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolea
     const common = [
       `--datadir=${data}`, `--port=${port}`, '--bind-address=127.0.0.1', `--log-error=${join(dir, 'server.log')}`,
     ];
-    if (name === 'mysql') {
+    if (isMysql) {
       await run(mysqld, ['--no-defaults', '--initialize-insecure', `--datadir=${data}`, `--log-error=${join(dir, 'init.log')}`], 180_000);
       // Without its certificates (and without generating new ones) the server has no TLS.
       if (noTls) {
@@ -155,14 +157,14 @@ async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolea
       await run(join(bin, 'mariadb-install-db.exe'), [`--datadir=${data}`, `--port=${port}`, `--password=${rootPassword}`, '--silent'], 180_000);
     }
     const fast = ['--innodb-buffer-pool-size=64M', '--innodb-flush-log-at-trx-commit=0', '--max-connections=60'];
-    const extra = name === 'mysql' ? ['--mysqlx=OFF', '--disable-log-bin'] : ['--skip-log-bin'];
+    const extra = isMysql ? ['--mysqlx=OFF', '--disable-log-bin'] : ['--skip-log-bin'];
     // A server without TLS: MySQL loses its certificates (removed after init) and may not generate new ones; MariaDB is told to skip it.
-    if (noTls) extra.push(name === 'mysql' ? '--auto-generate-certs=OFF' : '--skip-ssl');
+    if (noTls) extra.push(isMysql ? '--auto-generate-certs=OFF' : '--skip-ssl');
     // --no-defaults first: the machine's my.ini must not change how a test server runs.
     daemon = spawnDaemon(mysqld, ['--no-defaults', ...common, ...fast, ...extra]);
 
     const deadline = Date.now() + 90_000;
-    const initialRootPassword = name === 'mysql' ? '' : rootPassword;
+    const initialRootPassword = isMysql ? '' : rootPassword;
     let root: mysql.Connection | undefined;
     while (!root) {
       if (Date.now() > deadline) throw new Error(`${name} did not accept connections`);
@@ -176,7 +178,7 @@ async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolea
       }
     }
     try {
-      if (name === 'mysql') await root.query(`ALTER USER 'root'@'localhost' IDENTIFIED BY ${sqlString(rootPassword)}`);
+      if (isMysql) await root.query(`ALTER USER 'root'@'localhost' IDENTIFIED BY ${sqlString(rootPassword)}`);
       await root.query(`CREATE USER ${sqlString(user)}@'%' IDENTIFIED BY ${sqlString(password)}`);
       await root.query(`GRANT ALL PRIVILEGES ON *.* TO ${sqlString(user)}@'%' WITH GRANT OPTION`);
     } finally {
@@ -196,7 +198,7 @@ export interface TempServerOptions { emptyPassword?: boolean; noTls?: boolean }
 
 export async function startTempServer(name: ServerName, options: TempServerOptions = {}): Promise<TempServer> {
   if (name === 'postgres' || name === 'postgres-old') return startPostgres(name, options.emptyPassword ?? false);
-  if (name === 'mysql' || name === 'mariadb') return startMysqlFamily(name, options.emptyPassword ?? false, options.noTls ?? false);
+  if (name === 'mysql' || name === 'mysql-old' || name === 'mariadb' || name === 'mariadb-old') return startMysqlFamily(name, options.emptyPassword ?? false, options.noTls ?? false);
   throw new Error(`Temp ${name} servers are not available yet.`);
 }
 

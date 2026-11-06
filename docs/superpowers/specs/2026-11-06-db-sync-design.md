@@ -266,6 +266,16 @@ PostgreSQL 15 can't load this dump from dev 17. Upgrade your local image."
 - **MariaDB ed25519:** an account that signs in with the `ed25519` plugin is not
   supported, because the Node driver has no such plugin. DB Sync says so and asks
   for an account with a different sign-in method.
+- **PostgreSQL 15 and 16 local servers:** only PostgreSQL 14 and 18 tools are
+  bundled. A 15 or 16 server gets the 18 tools, whose dump a server older than 17
+  rejects (`transaction_timeout`). Servers 15 and 16 were not available to test; by
+  the same cause a sync to such a target is expected to fail at the restore, and
+  the backup, restored with the same tools, to fail too (recovery-failed, backup
+  kept). Adding the 15 and 16 tools is a manifest change of about 7 to 11 MB each.
+- **MySQL tools and a non-ASCII install path:** the MySQL tools receive
+  `--plugin-dir` in the Windows ANSI code page, so with an install folder outside
+  that code page the `mysql_native_password` plugin cannot be found and such
+  accounts fail to sign in (a MySQL 9.7 tool limit, not tested).
 - **PostgreSQL roles:** roles are not copied. A row-level security policy that
   names a role missing locally fails the restore, and the failure is handled as
   described above.
@@ -274,7 +284,7 @@ PostgreSQL 15 can't load this dump from dev 17. Upgrade your local image."
 
 | Engine | Tools | Selection |
 |---|---|---|
-| PostgreSQL | `pg_dump`, `pg_restore` and required DLLs, newest stable major version at build time | Always, because newer tools can read older servers |
+| PostgreSQL | `pg_dump`, `pg_restore` and required DLLs, for majors 18 (newest stable at build time) and 14 | The oldest bundled major that is not older than the server the tool talks to |
 | MySQL | `mysqldump`, `mysql` and required DLLs | When the server reports MySQL |
 | MariaDB | `mariadb-dump`, `mariadb` and required DLLs | When the server reports MariaDB |
 
@@ -312,13 +322,33 @@ They never connect to a database the test did not start. A service is already
 listening on `localhost:5432` on the development machine, and tests must not touch
 it.
 
-## Open risks to check during implementation
+## Compatibility results
 
-- Whether a `pg_dump` from the newest major version restores cleanly to older
-  local servers under `--exit-on-error`. Version-specific settings in the dump may
-  fail on older servers. The fallback is to bundle more than one PostgreSQL tool
-  version and select the one matching the target.
-- Whether the MySQL `mysqldump` needs `--column-statistics=0` for some server
-  versions.
-- The size of the installer, estimated at about 100 MB of bundled tools on top of
-  Electron.
+The risks listed during design were checked with real servers
+(`tests/integration/compatibility.test.ts`). The "old" servers are PostgreSQL
+14.24, MySQL 8.0.46 and MariaDB 10.11.19, the previous lines a dev server is
+likely to run.
+
+- **PostgreSQL 18 tools against PostgreSQL 14:** they do not restore cleanly.
+  `pg_dump` 18 writes `SET transaction_timeout = 0`, which a 14 server rejects
+  under `--exit-on-error`, and `pg_restore` 14 cannot read the 18 archive format.
+  This also broke recovery from the backup, because the backup was made with the
+  same tools. The fallback was needed: PostgreSQL 14 tools are bundled beside the
+  18 tools, and each tool run uses the oldest bundled major that is not older than
+  the server it talks to. The dump of the dev server, the backup of the local
+  database and the restore all follow this rule. Results:
+  14 to 14 and 14 to 18 succeed; 18 to 14 fails at the restore with "can't load
+  this dump from dev 18" and the previous local data is restored from the backup.
+- **`--column-statistics=0`:** not needed. MySQL 9.7 `mysqldump` dumps MySQL 9.7 and
+  MySQL 8.0 servers without it, and `mariadb-dump` does not use that feature.
+- **MySQL 9.7 tools and `mysql_native_password`:** MySQL 9 no longer includes
+  this sign-in method in the client, so `mysqldump` could not sign in to a MySQL 8.0
+  account that uses it. The client plugin `mysql_native_password.dll` from the same
+  archive is now bundled and the MySQL tools get `--plugin-dir`. Accounts that use
+  the method now work as source and target.
+- **MySQL 9.7 and MariaDB 12.3 against their previous lines:** 8.0 to 8.0, 8.0 to
+  9.7, 9.7 to 8.0, 10.11 to 10.11, 10.11 to 12.3 and 12.3 to 10.11 all succeed
+  with the bundled tools.
+- **Installer size:** the bundled tools take 50 MB on disk (PostgreSQL 18 11 MB,
+  PostgreSQL 14 7 MB, MySQL 23 MB, MariaDB 10 MB), under the 100 MB estimate. The
+  installer itself is measured when packaging is built.

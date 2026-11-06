@@ -90,9 +90,9 @@ describe('tool arguments', () => {
       expect(dumpArgs(ep, FILE, o).filter((a) => /ssl/.test(a))).toEqual([]);
     }
   });
-  it('passes --plugin-dir for mariadb only', () => {
+  it('passes --plugin-dir for both flavors when given one', () => {
     expect(restoreArgs(ep, FILE, { ...mariadb, pluginDir: 'C:\\plugins' })).toContain('--plugin-dir=C:\\plugins');
-    expect(restoreArgs(ep, FILE, { ...mysql, pluginDir: 'C:\\plugins' }).some((a) => a.startsWith('--plugin-dir'))).toBe(false);
+    expect(restoreArgs(ep, FILE, { ...mysql, pluginDir: 'C:\\plugins' })).toContain('--plugin-dir=C:\\plugins');
     expect(restoreArgs(ep, FILE, mariadb).some((a) => a.startsWith('--plugin-dir'))).toBe(false);
   });
 });

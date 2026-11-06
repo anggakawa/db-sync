@@ -6,7 +6,7 @@ export interface ToolOptions {
   flavor: MysqlFlavor;
   /** undefined leaves the mode to the tool's default (the local target). */
   ssl?: boolean;
-  /** Where the MariaDB client finds its authentication plugins (ed25519...). */
+  /** Where the client finds its authentication plugins: ed25519 for MariaDB, mysql_native_password for MySQL 9 (older servers still use it). */
   pluginDir?: string | null;
 }
 
@@ -64,7 +64,7 @@ function common(ep: Endpoint, defaultsFile: string, o: ToolOptions): string[] {
   const args = [
     `--defaults-file=${defaultsFile}`, `--host=${ep.host}`, `--port=${ep.port}`, '--protocol=tcp', '--default-character-set=utf8mb4', ...sslArgs(o),
   ];
-  if (o.flavor === 'mariadb' && o.pluginDir) args.push(`--plugin-dir=${o.pluginDir}`);
+  if (o.pluginDir) args.push(`--plugin-dir=${o.pluginDir}`);
   return args;
 }
 

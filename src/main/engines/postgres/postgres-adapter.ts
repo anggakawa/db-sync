@@ -70,11 +70,14 @@ function progressLines(pattern: RegExp, total: number, label: string, ctx: StepC
 }
 
 export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: string }): EngineAdapter {
-  async function runDump(ep: Endpoint, ssl: boolean | undefined, dest: string, total: number, label: string, ctx: StepContext) {
+  async function runDump(
+    ep: Endpoint, ssl: boolean | undefined, dest: string, total: number, label: string, ctx: StepContext, serverMajor: number,
+  ) {
     // pg_dump -Fd needs a missing or empty folder; a crash can leave one behind.
     await fs.rm(dest, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     await runTool({
-      command: deps.locate.path('postgres', 'dump'),
+      // The tool matching the server it dumps: a pg_dump older than its server refuses it, and a newer one writes SETs an older server rejects.
+      command: deps.locate.path('postgres', 'dump', serverMajor),
       args: dumpArgs(ep, dest),
       env: toolEnv(ep, ssl),
       signal: ctx.signal,
@@ -101,7 +104,7 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
         },
         async dump(destPath, ctx) {
           const total = (await readTables(client)).length;
-          await runDump(endpoint, endpoint.ssl, destPath, total, 'Downloading from dev', ctx);
+          await runDump(endpoint, endpoint.ssl, destPath, total, 'Downloading from dev', ctx, (await readInfo(client)).version[0]);
         },
         close: () => endQuietly(client),
       };
@@ -201,13 +204,13 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
         },
         async dump(destPath, ctx) {
           const total = (await target.listTables()).length;
-          await runDump(endpoint, undefined, destPath, total, 'Backing up local data', ctx);
+          await runDump(endpoint, undefined, destPath, total, 'Backing up local data', ctx, (await readInfo(client)).version[0]);
         },
         async restore(dumpPath, ctx) {
           const entries = await fs.readdir(dumpPath).catch(() => [] as string[]);
           const total = entries.filter((f) => /^\d+\.dat/.test(f)).length;
           await runTool({
-            command: deps.locate.path('postgres', 'restore'),
+            command: deps.locate.path('postgres', 'restore', (await readInfo(client)).version[0]),
             args: restoreArgs(endpoint, dumpPath),
             env: toolEnv(endpoint),
             signal: ctx.signal,

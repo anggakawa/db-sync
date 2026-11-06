@@ -1,5 +1,5 @@
 // Downloads the vendor client-tool archives pinned in tools/manifest.json, verifies SHA-256,
-// and extracts the allowlisted files into resources/tools/<flavor>/.
+// and extracts the allowlisted files into resources/tools/<dest>/ (dest defaults to the flavor).
 // With --with-servers, each full archive is also extracted to .cache/servers/<name>/.
 import { createWriteStream } from 'node:fs';
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
@@ -93,9 +93,9 @@ for (const entry of manifest) {
   if (!entry.bundle && !withServers) continue;
   const archive = await ensureArchive(entry);
   if (entry.bundle) {
-    const dest = join(root, 'resources', 'tools', entry.flavor);
+    const dest = join(root, 'resources', 'tools', entry.dest ?? entry.flavor);
     const did = await extractOnce(archive, entry, dest, entry.files, 1, entry.runtimeFrom);
-    console.log(`${entry.name}: ${did ? 'extracted' : 'up to date'} -> resources/tools/${entry.flavor}`);
+    console.log(`${entry.name}: ${did ? 'extracted' : 'up to date'} -> resources/tools/${entry.dest ?? entry.flavor}`);
   }
   if (withServers) {
     const dest = join(root, '.cache', 'servers', entry.name);

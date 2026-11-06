@@ -33,10 +33,40 @@ describe('createToolLocator', () => {
     expect(() => locator.path('mysql', 'dump')).toThrow(/mysqldump\.exe/);
   });
 
-  it("pluginDir is the mariadb lib/plugin folder and null for other flavors", () => {
+  it("pluginDir is the lib/plugin folder for mysql and mariadb and null for postgres", () => {
     const locator = createToolLocator(root);
     expect(locator.pluginDir("mariadb")).toBe(join(root, "mariadb", "lib", "plugin"));
-    expect(locator.pluginDir("mysql")).toBeNull();
+    expect(locator.pluginDir("mysql")).toBe(join(root, "mysql", "lib", "plugin"));
     expect(locator.pluginDir("postgres")).toBeNull();
+  });
+});
+
+describe('createToolLocator PostgreSQL majors', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'dbsync-tools-'));
+    for (const dir of ['postgres', 'postgres-14']) {
+      mkdirSync(join(root, dir, 'bin'), { recursive: true });
+      writeFileSync(join(root, dir, 'bin', 'pg_dump.exe'), '');
+    }
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it.each([
+    [undefined, 'postgres'],
+    [18, 'postgres'],
+    [19, 'postgres'],
+    [17, 'postgres'],
+    [15, 'postgres'],
+    [14, 'postgres-14'],
+    [13, 'postgres-14'],
+  ])('uses the %s server tools from %s', (major, dir) => {
+    expect(createToolLocator(root).path('postgres', 'dump', major)).toBe(join(root, dir, 'bin', 'pg_dump.exe'));
+  });
+
+  it('ignores the major for MySQL and MariaDB', () => {
+    mkdirSync(join(root, 'mysql', 'bin'), { recursive: true });
+    writeFileSync(join(root, 'mysql', 'bin', 'mysqldump.exe'), '');
+    expect(createToolLocator(root).path('mysql', 'dump', 8)).toBe(join(root, 'mysql', 'bin', 'mysqldump.exe'));
   });
 });
