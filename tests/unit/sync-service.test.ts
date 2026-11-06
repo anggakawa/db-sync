@@ -1,7 +1,8 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { promises as realFs } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EngineAdapter } from '../../src/main/engines/adapter';
 import { createProfileStore, type Cipher, type ProfileStore } from '../../src/main/profiles/profile-store';
 import { checkTargetHost } from '../../src/main/safety/target-guard';
@@ -49,7 +50,7 @@ const until = async (cond: () => boolean) => {
 let root: string;
 let paths: SyncPaths;
 beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'sync-service-')); paths = createSyncPaths(root); });
-afterEach(async () => { await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.restoreAllMocks(); await rm(root, { recursive: true, force: true }); });
 
 interface Rig {
   store: ProfileStore;
@@ -359,7 +360,73 @@ describe('startup', () => {
   });
 
   it('works when there is no tmp folder yet', async () => {
-    await expect(rig().service.startup()).resolves.toBeUndefined();
+    await expect(rig().service.startup()).resolves.toEqual([]);
+  });
+});
+
+describe('startup repairs', () => {
+  it('removes each client-*.cnf on its own, so one locked file does not stop the others, and reports it', async () => {
+    const r = rig();
+    await mkdir(paths.tmpRoot, { recursive: true });
+    const locked = join(paths.tmpRoot, 'client-locked.cnf');
+    await writeFile(locked, 'password=x');
+    await writeFile(join(paths.tmpRoot, 'client-other.cnf'), 'password=y');
+    await writeFile(join(paths.tmpRoot, 'p1.dump'), 'x');
+    const realRm = realFs.rm.bind(realFs);
+    vi.spyOn(realFs, 'rm').mockImplementation(async (path, opts) => {
+      if (String(path) === locked) throw new Error('EBUSY');
+      return realRm(path, opts);
+    });
+    const problems = await r.service.startup();
+    expect(problems.join(' ')).toContain(locked);
+    expect(await exists(join(paths.tmpRoot, 'client-other.cnf'))).toBe(false);
+    expect(await exists(join(paths.tmpRoot, 'p1.dump'))).toBe(false);
+  });
+
+  it('removes backups/*/incoming', async () => {
+    const r = rig();
+    await mkdir(paths.backupIncoming('p1'), { recursive: true });
+    await mkdir(paths.backupLatest('p1'), { recursive: true });
+    await r.service.startup();
+    expect(await exists(paths.backupIncoming('p1'))).toBe(false);
+    expect(await exists(paths.backupLatest('p1'))).toBe(true);
+  });
+
+  it('puts previous back as latest when a crash mid-swap left no latest', async () => {
+    const r = rig();
+    await mkdir(paths.backupPrevious('p1'), { recursive: true });
+    await writeFile(join(paths.backupPrevious('p1'), 'good'), 'data');
+    await r.service.startup();
+    expect(await exists(paths.backupPrevious('p1'))).toBe(false);
+    expect(await readFile(join(paths.backupLatest('p1'), 'good'), 'utf8')).toBe('data');
+  });
+
+  it('leaves previous alone when latest exists, and survives a missing backups folder', async () => {
+    const r = rig();
+    await expect(r.service.startup()).resolves.toEqual([]);
+    await mkdir(paths.backupPrevious('p1'), { recursive: true });
+    await mkdir(paths.backupLatest('p1'), { recursive: true });
+    await r.service.startup();
+    expect(await exists(paths.backupPrevious('p1'))).toBe(true);
+    expect(await exists(paths.backupLatest('p1'))).toBe(true);
+  });
+
+  it('never throws, even when the tmp folder cannot be removed', async () => {
+    const r = rig();
+    await mkdir(paths.tmpRoot, { recursive: true });
+    vi.spyOn(realFs, 'rm').mockRejectedValue(new Error('EPERM'));
+    const problems = await r.service.startup();
+    expect(problems.length).toBeGreaterThan(0);
+  });
+});
+
+describe('closing', () => {
+  it('markClosing refuses new runs without cancelling anything', async () => {
+    const r = rig();
+    const id = (await r.service.saveProfile(input())).id;
+    r.service.markClosing();
+    await expect(r.service.startSync(id)).rejects.toThrow(/closing/i);
+    await expect(r.service.recover(id)).rejects.toThrow(/closing/i);
   });
 });
 
@@ -504,6 +571,36 @@ describe('testConnection', () => {
     const res = await r.service.testConnection(i, 'target');
     expect(res).toMatchObject({ ok: false, message: expect.stringMatching(/enter it again/i) });
     expect(r.openedWith).toEqual([]);
+  });
+
+  it('tests only the side asked about', async () => {
+    const r = rig();
+    const i = input();
+    i.target.host = '';
+    i.name = '';
+    expect(await r.service.testConnection(i, 'source')).toMatchObject({ ok: true });
+    const j = input();
+    j.source.host = '';
+    expect(await r.service.testConnection(j, 'target')).toMatchObject({ ok: true });
+    expect(await r.service.testConnection(i, 'target')).toMatchObject({ ok: false, message: expect.stringMatching(/Target host is required/) });
+  });
+
+  it('does not send the stored source password to a changed host or port, and makes no driver call', async () => {
+    const r = rig();
+    const saved = await r.service.saveProfile(input());
+    for (const change of [(i: ProfileInput) => { i.source.host = 'typo.example.com'; }, (i: ProfileInput) => { i.source.port = 6000; }]) {
+      const i = input({ id: saved.id });
+      change(i);
+      delete i.source.password;
+      expect(await r.service.testConnection(i, 'source')).toEqual({ ok: false, message: 'Enter the password for the new host.' });
+      await expect(r.service.saveProfile(i)).rejects.toThrow('Enter the password for the new host.');
+    }
+    expect(r.openedWith).toEqual([]);
+    const typed = input({ id: saved.id });
+    typed.source.host = 'new.example.com';
+    typed.source.password = 'typed';
+    expect(await r.service.testConnection(typed, 'source')).toMatchObject({ ok: true });
+    expect(r.openedWith).toEqual([{ side: 'source', password: 'typed' }]);
   });
 
   it('returns a message for invalid input instead of throwing', async () => {

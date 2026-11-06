@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import { dirname, join } from 'node:path';
 import type { ConnectionSide, ConnectionTestResult } from '../../shared/api';
 import { PROFILE_ID, SyncBusyError } from '../../shared/api';
 import type {
@@ -6,7 +7,7 @@ import type {
 } from '../../shared/types';
 import type { EngineAdapter } from '../engines/adapter';
 import {
-  PasswordUnreadableError, resolveInput, toView, type ProfileEntry, type ProfileStore, type UnreadablePasswords,
+  PasswordUnreadableError, resolveSource, resolveTarget, toView, type ProfileEntry, type ProfileStore, type UnreadablePasswords,
 } from '../profiles/profile-store';
 import { redact } from '../process/redact';
 import type { GuardResult } from '../safety/target-guard';
@@ -179,9 +180,39 @@ export function createSyncService(deps: SyncServiceDeps) {
   }
 
   return {
-    /** Run once at startup, before any sync. Removes every leftover in tmp, such as client-*.cnf files that hold a password. */
-    async startup(): Promise<void> {
-      await fs.rm(paths.tmpRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    /**
+     * Run once at startup, before any sync. Never throws; returns what it could not clean up.
+     * Clears tmp (each client-*.cnf, which holds a password, on its own first), removes half-written backups, and puts a
+     * good backup back when a crash hit the middle of the swap.
+     */
+    async startup(): Promise<string[]> {
+      const problems: string[] = [];
+      const remove = async (p: string) => {
+        try {
+          await fs.rm(p, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        } catch (err) {
+          problems.push(`Could not remove ${p}: ${errorText(err)}`);
+        }
+      };
+      let names: string[] = [];
+      try { names = await fs.readdir(paths.tmpRoot); } catch { /* no tmp folder yet */ }
+      for (const name of names.filter((n) => /^client-.*.cnf$/.test(n))) await remove(join(paths.tmpRoot, name));
+      await remove(paths.tmpRoot);
+
+      const backups = dirname(paths.backupDir('x'));
+      let ids: string[] = [];
+      try { ids = await fs.readdir(backups); } catch { /* no backups yet */ }
+      for (const id of ids) {
+        await remove(paths.backupIncoming(id));
+        if (!(await exists(paths.backupLatest(id))) && (await exists(paths.backupPrevious(id)))) {
+          try {
+            await fs.rename(paths.backupPrevious(id), paths.backupLatest(id));
+          } catch (err) {
+            problems.push(`Could not put the previous backup back for ${id}: ${errorText(err)}`);
+          }
+        }
+      }
+      return problems;
     },
 
     async listProfiles(): Promise<ProfileView[]> {
@@ -215,23 +246,27 @@ export function createSyncService(deps: SyncServiceDeps) {
     async testConnection(input: ProfileInput, side: ConnectionSide): Promise<ConnectionTestResult> {
       if (input.id !== undefined) assertId(input.id);
       const entry = input.id ? (await store.listEntries()).find((e) => e.profile.id === input.id) : undefined;
-      if (input[side].password === undefined && entry?.unreadable[side]) {
-        return { ok: false, message: new PasswordUnreadableError({ source: side === 'source', target: side === 'target' }).message };
-      }
-      let profile: Profile;
+      const existing = entry?.profile ?? null;
+      let endpoint: Profile['source'] | Profile['target'];
       try {
-        profile = resolveInput(input, entry?.profile ?? null);
+        // Only the tested side is validated and resolved: each side has its own button.
+        endpoint = side === 'source' ? resolveSource(input, existing) : resolveTarget(input, existing);
       } catch (err) {
         return { ok: false, message: errorText(err) };
       }
-      const secrets = [profile.source.password, profile.target.password];
+      if (input[side].password === undefined && entry?.unreadable[side]) {
+        return { ok: false, message: new PasswordUnreadableError({ source: side === 'source', target: side === 'target' }).message };
+      }
+      const secrets = [endpoint.password];
       if (side === 'target') {
-        const guard = await deps.checkTarget(profile.target.host);
+        const guard = await deps.checkTarget(endpoint.host);
         if (!guard.allowed) return { ok: false, message: guard.reason };
       }
       try {
-        const adapter = deps.adapterFor(profile.engine);
-        const db = side === 'source' ? await adapter.openSource(profile.source) : await adapter.openTarget(profile.target);
+        const adapter = deps.adapterFor(input.engine);
+        const db = side === 'source'
+          ? await adapter.openSource(endpoint as Profile['source'])
+          : await adapter.openTarget(endpoint);
         try {
           const info = await db.info();
           return { ok: true, versionLabel: info.versionLabel, flavor: info.flavor };
@@ -263,6 +298,11 @@ export function createSyncService(deps: SyncServiceDeps) {
 
     hasRunningSync: () => current !== null,
 
+    /** The window is going away: from here no new run starts. Does not cancel a run. */
+    markClosing(): void {
+      closing = true;
+    },
+
     /** Resolves when no run is active, after any automatic recovery has finished. */
     async whenIdle(): Promise<void> {
       while (current) await current.done;
@@ -270,7 +310,7 @@ export function createSyncService(deps: SyncServiceDeps) {
 
     /** For quitting: refuses new runs, cancels the current one and waits for its outcome, recovery included. */
     async shutdown(): Promise<void> {
-      closing = true;
+      this.markClosing();
       await this.cancel();
       await this.whenIdle();
     },

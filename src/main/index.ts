@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
-import { app, BrowserWindow, dialog, ipcMain, safeStorage } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage } from 'electron';
 import { CHANNELS } from '../shared/api';
 import type { Engine } from '../shared/types';
 import { createMysqlAdapter } from './engines/mysql/mysql-adapter';
@@ -83,59 +83,87 @@ function createWindow(svc: SyncService): void {
   let confirmed = false;
   let asking = false;
   win.on('close', (event) => {
-    if (confirmed || !svc.hasRunningSync()) return;
+    if (confirmed) return;
+    if (!svc.hasRunningSync()) { svc.markClosing(); return; } // the window goes: no new sync from here
     event.preventDefault();
     if (asking) return;
     asking = true;
     void (async () => {
-      const answer = await dialog.showMessageBox(win, {
-        type: 'warning',
-        title: 'Sync in progress',
-        message: 'A sync is running. Cancel it and close DB Sync?',
-        detail: 'The sync is cancelled and your local database is put back as it was before the app closes. This can take a moment.',
-        buttons: ['Cancel sync and close', 'Keep syncing'],
-        defaultId: 1,
-        cancelId: 1,
-        noLink: true,
-      });
-      if (answer.response !== 0) { asking = false; return; }
-      if (!win.isDestroyed()) win.setTitle('DB Sync - stopping the sync...');
-      await svc.shutdown();
-      confirmed = true;
-      if (!win.isDestroyed()) win.close();
+      try {
+        const answer = await dialog.showMessageBox(win, {
+          type: 'warning',
+          title: 'Sync in progress',
+          message: 'A sync is running. Cancel it and close DB Sync?',
+          detail: 'The sync is cancelled and your local database is put back as it was before the app closes. This can take a moment.',
+          buttons: ['Cancel sync and close', 'Keep syncing'],
+          defaultId: 1,
+          cancelId: 1,
+          noLink: true,
+        });
+        if (answer.response !== 0) { asking = false; return; }
+        if (!win.isDestroyed()) win.setTitle('DB Sync - stopping the sync...');
+        await svc.shutdown();
+        confirmed = true;
+        if (!win.isDestroyed()) win.close();
+      } catch (err) {
+        console.error('Closing the window failed:', err);
+        asking = false;
+      }
     })();
   });
 
-  if (process.env['ELECTRON_RENDERER_URL']) {
+  if (!app.isPackaged && process.env['ELECTRON_RENDERER_URL']) {
     void win.loadURL(process.env['ELECTRON_RENDERER_URL']);
   } else {
     void win.loadFile(join(__dirname, '../renderer/index.html'));
   }
 }
 
-void app.whenReady().then(async () => {
-  const send = (channel: string, ...args: unknown[]) => {
+// One instance per userData folder: a second one would clear tmp and could drop the same target under a running sync.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
     const win = mainWindow;
-    if (win && !win.isDestroyed()) win.webContents.send(channel, ...args);
-  };
-  const svc = buildService(send);
-  service = svc;
-  await svc.startup(); // clears leftover tmp files before anything can run
-  registerIpc(ipcMain, svc, (e) => mainWindow !== null && e.sender === mainWindow.webContents);
-  createWindow(svc);
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow(svc);
+    if (!win || win.isDestroyed()) return;
+    if (win.isMinimized()) win.restore();
+    win.focus();
   });
-});
 
-// Any other way to quit goes through the window, so the same confirmation and wait apply.
-app.on('before-quit', (event) => {
-  if (service?.hasRunningSync() && mainWindow && !mainWindow.isDestroyed()) {
+  void app.whenReady().then(async () => {
+    Menu.setApplicationMenu(null); // no Reload or DevTools: a reload would lose a pending warnings prompt
+    const send = (channel: string, ...args: unknown[]) => {
+      const win = mainWindow;
+      if (win && !win.isDestroyed()) win.webContents.send(channel, ...args);
+    };
+    const svc = buildService(send);
+    service = svc;
+    try {
+      // Only now that this is the one instance: clear leftovers and repair an interrupted backup swap.
+      for (const problem of await svc.startup()) console.error(problem);
+    } catch (err) {
+      console.error('Startup cleanup failed:', err);
+    }
+    registerIpc(ipcMain, svc, (e) => mainWindow !== null && e.sender === mainWindow.webContents);
+    createWindow(svc); // always, even when cleanup had problems
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow(svc);
+    });
+  });
+
+  // Any other way to quit waits for a running sync: through the window when there is one, otherwise directly.
+  app.on('before-quit', (event) => {
+    if (!service?.hasRunningSync()) return;
     event.preventDefault();
-    mainWindow.close();
-  }
-});
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.close();
+    } else {
+      void service.shutdown().finally(() => app.quit());
+    }
+  });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
+  });
+}

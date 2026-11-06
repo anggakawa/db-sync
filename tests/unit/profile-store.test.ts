@@ -217,17 +217,78 @@ describe('profile store resilience', () => {
     expect(flagged.target.passwordUnreadable).toBe(true);
   });
 
-  it('save keeps working on a profile with an unreadable password', async () => {
+  it('save keeps the unreadable ciphertext and the flag when only another field changes', async () => {
+    const store = createProfileStore(file, fakeCipher());
+    const bad = input();
+    bad.target.password = 'lost-key';
+    const saved = await store.save(bad);
+    const before = JSON.parse(await fs.readFile(file, 'utf8')).profiles[0].target.password as string;
+    const reader = createProfileStore(file, brokenFor('lost-key'));
+    const i = input({ id: saved.id, name: 'Renamed' });
+    delete i.target.password;
+    delete i.source.password;
+    const again = await reader.save(i);
+    expect(again.name).toBe('Renamed');
+    expect(JSON.parse(await fs.readFile(file, 'utf8')).profiles[0].target.password).toBe(before);
+    expect((await reader.listEntries())[0].unreadable).toEqual({ source: false, target: true });
+  });
+
+  it('a typed password replaces an unreadable one', async () => {
     const store = createProfileStore(file, fakeCipher());
     const bad = input();
     bad.target.password = 'lost-key';
     const saved = await store.save(bad);
     const reader = createProfileStore(file, brokenFor('lost-key'));
-    const i = input({ id: saved.id, name: 'Renamed' });
-    delete i.target.password;
-    const again = await reader.save(i);
-    expect(again.name).toBe('Renamed');
-    expect(again.target.password).toBe('');
+    const i = input({ id: saved.id });
+    i.target.password = 'fresh';
+    await reader.save(i);
+    expect((await reader.listEntries())[0].unreadable).toEqual({ source: false, target: false });
+    expect((await reader.get(saved.id)).target.password).toBe('fresh');
+  });
+
+  it('reuses the stored source password only while source host and port are unchanged', async () => {
+    const store = createProfileStore(file, fakeCipher());
+    const saved = await store.save(input());
+    const keep = input({ id: saved.id, name: 'Same' });
+    delete keep.source.password;
+    delete keep.target.password;
+    expect((await store.save(keep)).source.password).toBe('hunter2');
+    for (const change of [(i: ProfileInput) => { i.source.host = 'evil.example.com'; }, (i: ProfileInput) => { i.source.port = 5999; }]) {
+      const moved = input({ id: saved.id });
+      change(moved);
+      delete moved.source.password;
+      const before = await fs.readFile(file, 'utf8');
+      await expect(store.save(moved)).rejects.toThrow('Enter the password for the new host.');
+      expect(await fs.readFile(file, 'utf8')).toBe(before);
+    }
+    const typed = input({ id: saved.id });
+    typed.source.host = 'new.example.com';
+    typed.source.password = '';
+    expect((await store.save(typed)).source.password).toBe('');
+    // the target side keeps its stored password even when its host changes
+    const t = input({ id: saved.id });
+    t.source.password = 'x';
+    t.target.host = '127.0.0.1';
+    delete t.target.password;
+    expect((await store.save(t)).target.password).toBe('hunter2');
+  });
+
+  it.each([
+    ['profile missing fields', '{"profiles":[{"id":"a"}]}'],
+    ['number entry', '[1]'],
+    ['number in profiles', '{"profiles":[1]}'],
+    ['null in profiles', '{"profiles":[null]}'],
+    ['non-string password', JSON.stringify({ profiles: [{ id: 'a', name: 'n', engine: 'postgres', backupEnabled: true,
+      source: { host: 'h', port: 1, user: 'u', password: 5, database: 'd', ssl: false },
+      target: { host: 'h', port: 1, user: 'u', password: '', database: 'd' } }] })],
+  ])('treats %s as corrupt and never rewrites the file', async (_l, text) => {
+    await fs.writeFile(file, text, 'utf8');
+    const store = createProfileStore(file, fakeCipher());
+    await expect(store.list()).rejects.toThrow(file);
+    await expect(store.save(input())).rejects.toThrow(file);
+    await expect(store.remove('a')).rejects.toThrow(file);
+    await expect(store.setLastResult('a', { status: 'cancelled', targetState: 'untouched' })).rejects.toThrow(file);
+    expect(await fs.readFile(file, 'utf8')).toBe(text);
   });
 
   it('names the file when profiles.json is corrupt, and does not overwrite it', async () => {
