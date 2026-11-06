@@ -6,14 +6,15 @@ import { pipeline } from 'node:stream/promises';
 import { createGunzip, createGzip } from 'node:zlib';
 import mysql, { type Connection } from 'mysql2/promise';
 import type { CheckIssue, Endpoint, SourceEndpoint } from '../../../shared/types';
-import { runTool } from '../../process/process-runner';
+import { ToolError, runTool } from '../../process/process-runner';
 import type { ToolLocator } from '../../tools/tool-locator';
 import {
   DropBlockedError, type CreateOptions, type EngineAdapter, type ServerInfo, type SourceDatabase, type StepContext,
   type TargetDatabase,
 } from '../adapter';
 import { DDL_TIMEOUT_MS, requireEndpoint } from '../limits';
-import { defaultsFileContent, dumpArgs, loginFileEnv, parseServerVersion, restoreArgs, type MysqlFlavor } from './args';
+import {
+  defaultsFileContent, dumpArgs, hasNonAscii, loginFileEnv, parseServerVersion, unreadableFolderMessage, unsupportedNameMessage, restoreArgs, type MysqlFlavor } from './args';
 import {
   connect, endQuietly, ER_DBACCESS_DENIED, ER_LOCK_WAIT_TIMEOUT, ER_SPECIFIC_ACCESS_DENIED, ER_UNKNOWN_SYSTEM_VARIABLE, ER_TABLEACCESS_DENIED, errnoOf,
   guardedQuery as q,
@@ -127,6 +128,7 @@ export function createMysqlAdapter(deps: {
     // A crash can leave a file (or, from another engine, a folder) behind.
     await fs.rm(dest, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     const { flavor } = await readVersion(conn);
+    if (flavor === 'mysql' && hasNonAscii(ep.database)) throw new Error(unsupportedNameMessage(ep.database));
     const report = percentReporter(await readSize(conn, ep.database), label, ctx);
     await withDefaultsFile(ep, ctx, async (defaultsFile) => {
       let bytes = 0;
@@ -159,6 +161,7 @@ export function createMysqlAdapter(deps: {
   /** The file, gunzipped, into the client's stdin. The client stops at the first error. */
   async function runRestore(conn: Connection, ep: Endpoint, dumpPath: string, ctx: StepContext) {
     const { flavor } = await readVersion(conn);
+    if (flavor === 'mysql' && hasNonAscii(ep.database)) throw new Error(unsupportedNameMessage(ep.database));
     const { size } = await fs.stat(dumpPath);
     const report = percentReporter(size, 'Restoring local data', ctx);
     await withDefaultsFile(ep, ctx, async (defaultsFile) => {
@@ -191,6 +194,33 @@ export function createMysqlAdapter(deps: {
       if (!complete) throw new Error('The restore stopped before the whole dump was read, so the local database is incomplete.');
       ctx.onProgress('Restoring local data', 100);
     });
+  }
+
+  /**
+   * Runs each MySQL tool with a defaults file from tmpRoot and --version. The tool opens the file before anything else,
+   * so a folder it cannot decode fails here with "defaults file" in its message; any other failure is not this problem.
+   */
+  async function toolsCanReadFolder(): Promise<boolean> {
+    await fs.mkdir(deps.tmpRoot, { recursive: true });
+    const name = `probe-${randomBytes(8).toString('hex')}.cnf`;
+    const file = join(deps.tmpRoot, name);
+    await fs.writeFile(file, '[client]\n', { flag: 'wx' });
+    try {
+      for (const tool of ['restore', 'dump'] as const) {
+        try {
+          await runTool({
+            command: deps.locate.path('mysql', tool), args: [`--defaults-file=${name}`, '--version'], cwd: deps.tmpRoot,
+            env: loginFileEnv(deps.tmpRoot), signal: new AbortController().signal, secrets: [],
+          });
+        } catch (err) {
+          if (err instanceof ToolError && /defaults file/i.test(err.stderrTail)) return false;
+          throw err;
+        }
+      }
+      return true;
+    } finally {
+      await fs.rm(file, { force: true, maxRetries: 3, retryDelay: 100 }).catch(() => undefined);
+    }
   }
 
   /** The reads that both sides share, and whether the server folds database names. */
@@ -354,16 +384,28 @@ export function createMysqlAdapter(deps: {
       return target;
     },
 
-    async engineChecks(source): Promise<CheckIssue[]> {
+    async engineChecks(source, target): Promise<CheckIssue[]> {
       if (!('nonInnoDbTables' in source)) {
         throw new Error('The MySQL adapter was given a database that is not from this adapter.');
       }
+      const issues: CheckIssue[] = [];
+      // The MySQL tools (not MariaDB's) cannot take a non-ASCII name or read from a folder they cannot decode.
+      if ((await target.info()).flavor === 'mysql') {
+        for (const name of [await source.databaseKey(), await target.databaseKey()]) {
+          if (hasNonAscii(name) && !issues.some((i) => i.message.includes(name))) {
+            issues.push({ severity: 'blocker', code: 'unsupported-database-name', message: unsupportedNameMessage(name) });
+          }
+        }
+        if (!(await toolsCanReadFolder())) {
+          issues.push({ severity: 'blocker', code: 'tools-cannot-read-folder', message: unreadableFolderMessage(deps.tmpRoot) });
+        }
+      }
       const tables = await (source as MysqlSource).nonInnoDbTables();
-      if (tables.length === 0) return [];
+      if (tables.length === 0) return issues;
       const byEngine = new Map<string, string[]>();
       for (const t of tables) byEngine.set(t.engine, [...(byEngine.get(t.engine) ?? []), t.name]);
       const listing = [...byEngine].map(([engine, names]) => `${engine}: ${names.join(', ')}`).join('; ');
-      return [{
+      return [...issues, {
         severity: 'warning',
         code: 'non-transactional-tables',
         message: `Dev has tables that are not InnoDB (${listing}). They are copied without a transaction, so the copy may mix data from different moments.`,

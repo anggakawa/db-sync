@@ -251,6 +251,13 @@ PostgreSQL 15 can't load this dump from dev 17. Upgrade your local image."
   `kubectl port-forward`. Users must not use such a port as a target.
 - **Other local databases:** the guard does not stop a profile from overwriting
   another local database, so the confirmation dialog names the target.
+- **MySQL tools and non-ASCII text:** MySQL's command-line tools (not MariaDB's)
+  receive their arguments in the Windows ANSI code page. A database name with a
+  non-ASCII character reaches them mangled, so the check blocks it
+  (`unsupported-database-name`). They also cannot open a defaults file from a data
+  folder whose name has characters outside that code page, so the check blocks
+  that too (`tools-cannot-read-folder`). Both stop the sync before anything is
+  dropped, whether or not a backup is on.
 - **MariaDB ed25519:** an account that signs in with the `ed25519` plugin is not
   supported, because the Node driver has no such plugin. DB Sync says so and asks
   for an account with a different sign-in method.

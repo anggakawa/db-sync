@@ -10,6 +10,15 @@ export interface ToolOptions {
   pluginDir?: string | null;
 }
 
+/** The MySQL command-line tools get arguments in the ANSI code page, so a name outside ASCII arrives mangled. */
+export const hasNonAscii = (name: string): boolean => /[^\x00-\x7f]/.test(name);
+
+export const unsupportedNameMessage = (name: string): string =>
+  `MySQL's command-line tools can't handle the database name ${name}. Rename the database or use one with only English letters and numbers.`;
+
+export const unreadableFolderMessage = (folder: string): string =>
+  `MySQL's command-line tools can't read files in ${folder}, usually because the folder name has characters they don't support.`;
+
 export function parseServerVersion(text: string): { flavor: MysqlFlavor; version: [number, number]; versionLabel: string } {
   const flavor: MysqlFlavor = /mariadb/i.test(text) ? 'mariadb' : 'mysql';
   // Some MariaDB servers report a "5.5.5-" prefix for old clients.

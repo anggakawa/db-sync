@@ -739,7 +739,7 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
       await createDb(local, 'args_t', ['CREATE TABLE old (id INT)']);
       toolRuns.length = 0;
       expect((await runSyncForTest(adapter, profileFor('dev_app', 'args_t'), rootDir)).outcome.status).toBe('success');
-      const runs = toolRuns.filter(mine);
+      const runs = toolRuns.filter(mine).filter((r) => r.args.some((a) => a.startsWith('--port='))); // not the version probe
       expect(runs.length).toBeGreaterThanOrEqual(3); // source dump, backup dump, restore
       for (const run of runs) {
         expect(run.args[0]).toMatch(/^--defaults-file=client-[0-9a-f]+\.cnf$/);
@@ -870,42 +870,95 @@ port=${local.port}
       expect(await select(local, 'kill_café', 'SELECT COUNT(*) AS n FROM k')).toEqual([{ n: 0 }]);
     });
 
-    // KNOWN FAILURES on the MySQL tools only (reported, not worked around; the MariaDB tools handle all of these): the tools receive their arguments in
-    // the ANSI code page, so `é` arrives as `?` and the database is not found. `it.fails` passes while this is so and
-    // starts failing the day it is fixed.
-    (flavor === 'mysql' ? it.fails : it)('works with a non-ASCII character in the source database name', async () => {
-      await createDb(source, 'dév_src', ['CREATE TABLE t (id INT)', 'INSERT INTO t VALUES (3)']);
-      await createDb(local, 'cible_plain', ['CREATE TABLE old (id INT)']);
-      const { outcome } = await runSyncForTest(adapter, profileFor('dév_src', 'cible_plain'), rootDir);
-      expect(outcome, JSON.stringify(outcome)).toMatchObject({ status: 'success' });
-      expect(await select(local, 'cible_plain', 'SELECT id FROM t')).toEqual([{ id: 3 }]);
+    // The MySQL command-line tools (not MariaDB's) get their arguments in the ANSI code page, so `é` arrives as `?`.
+    // Check must stop such a sync before anything is dropped, with or without a backup.
+    describe.runIf(flavor === 'mysql')('names and folders the MySQL tools cannot handle', () => {
+      const nameMessage = (name: string) =>
+        `MySQL's command-line tools can't handle the database name ${name}. Rename the database or use one with only English letters and numbers.`;
+
+      it.each([
+        ['source', 'dév_src', 'cible_ok'],
+        ['target', 'dev_app', 'cible_é'],
+      ] as const)('stops at Check for a non-ASCII %s database name, with the target untouched and a backup on or off', async (side, srcName, tgtName) => {
+        if (side === 'source') await createDb(source, srcName, ['CREATE TABLE t (id INT)', 'INSERT INTO t VALUES (3)']);
+        await createDb(local, tgtName, ['CREATE TABLE keep (id INT)', 'INSERT INTO keep VALUES (1)']);
+        const bad = side === 'source' ? srcName : tgtName;
+        for (const backupEnabled of [true, false]) {
+          toolRuns.length = 0;
+          const { outcome } = await runSyncForTest(adapter, profileFor(srcName, tgtName, { backupEnabled }), rootDir);
+          expect(outcome).toMatchObject({ status: 'failed', step: 'check', targetState: 'untouched' });
+          expect(outcome.status === 'failed' && outcome.details).toContain('unsupported-database-name');
+          expect(outcome.status === 'failed' && outcome.message).toContain(nameMessage(bad));
+          // Nothing ran against either server, and the local data is as it was.
+          expect(toolRuns.filter((r) => r.args.some((a) => a.startsWith('--port='))).length).toBe(0);
+          expect(await select(local, tgtName, 'SELECT id FROM keep')).toEqual([{ id: 1 }]);
+        }
+      });
+
+      it('refuses a direct dump or restore with such a name, so recovery cannot run with a mangled name', async () => {
+        await createDb(source, 'dév_guard', ['CREATE TABLE t (id INT)']);
+        await createDb(local, 'garde_é', ['CREATE TABLE keep (id INT)', 'INSERT INTO keep VALUES (1)']);
+        const s = await adapter.openSource({ ...endpoint(source, 'dév_guard'), ssl: false });
+        const t = await adapter.openTarget(endpoint(local, 'garde_é'));
+        const file = join(workDir, 'guard.sql.gz');
+        await fs.writeFile(file, gzipSync('DROP TABLE keep;\n'));
+        try {
+          await expect(s.dump(join(workDir, 'guard-dump.sql.gz'), ctx())).rejects.toThrow(nameMessage('dév_guard'));
+          await expect(t.dump(join(workDir, 'guard-backup.sql.gz'), ctx())).rejects.toThrow(nameMessage('garde_é'));
+          await expect(t.restore(file, ctx())).rejects.toThrow(nameMessage('garde_é'));
+        } finally {
+          await s.close();
+          await t.close();
+        }
+        expect(await select(local, 'garde_é', 'SELECT id FROM keep')).toEqual([{ id: 1 }]);
+      });
+
+      it('stops at Check when the tools cannot read the data folder, with a backup on or off', async () => {
+        const jaRoot = join(workDir, 'データ');
+        const jaAdapter = createMysqlAdapter({ locate, tmpRoot: join(jaRoot, 'tmp') });
+        await createDb(local, 'ja_t', ['CREATE TABLE keep (id INT)', 'INSERT INTO keep VALUES (1)']);
+        for (const backupEnabled of [true, false]) {
+          toolRuns.length = 0;
+          const { outcome } = await runSyncForTest(jaAdapter, profileFor('dev_app', 'ja_t', { backupEnabled }), jaRoot);
+          expect(outcome).toMatchObject({ status: 'failed', step: 'check', targetState: 'untouched' });
+          expect(outcome.status === 'failed' && outcome.details).toContain('tools-cannot-read-folder');
+          expect(outcome.status === 'failed' && outcome.message).toBe(
+            `MySQL's command-line tools can't read files in ${join(jaRoot, 'tmp')}, usually because the folder name has characters they don't support.`,
+          );
+          expect(toolRuns.filter((r) => r.args.some((a) => a.startsWith('--port='))).length).toBe(0);
+          expect(await select(local, 'ja_t', 'SELECT id FROM keep')).toEqual([{ id: 1 }]);
+        }
+        expect((await fs.readdir(join(jaRoot, 'tmp')).catch(() => [])).filter((f) => f.endsWith('.cnf'))).toEqual([]);
+      });
+
+      it('does not block a folder with an accent that the tools can read', async () => {
+        const t = await adapter.openTarget(endpoint(local, 'never_created'));
+        const s = await adapter.openSource({ ...endpoint(source, 'dev_app'), ssl: false });
+        try {
+          expect(await adapter.engineChecks(s, t)).toEqual([]); // rootDir is "dá ta sync"
+        } finally {
+          await s.close();
+          await t.close();
+        }
+      });
     });
 
-    (flavor === 'mysql' ? it.fails : it)('works with a non-ASCII character in the target database name', async () => {
-      await createDb(local, 'cible_é', ['CREATE TABLE old (id INT)']);
-      const { outcome } = await runSyncForTest(adapter, profileFor('dev_app', 'cible_é'), rootDir);
-      expect(outcome, JSON.stringify(outcome)).toMatchObject({ status: 'success' });
-      expect((await snapshot(local, 'cible_é')).customers.length).toBe(2);
-    });
+    // The MariaDB tools handle all of these.
+    describe.runIf(flavor === 'mariadb')('names and folders the MariaDB tools handle', () => {
+      it('syncs with a non-ASCII source name, a non-ASCII target name and a Japanese data folder', async () => {
+        await createDb(source, 'dév_src', ['CREATE TABLE t (id INT)', 'INSERT INTO t VALUES (3)']);
+        await createDb(local, 'cible_é', ['CREATE TABLE old (id INT)']);
+        const first = await runSyncForTest(adapter, profileFor('dév_src', 'cible_é'), rootDir);
+        expect(first.outcome, JSON.stringify(first.outcome)).toMatchObject({ status: 'success' });
+        expect(await select(local, 'cible_é', 'SELECT id FROM t')).toEqual([{ id: 3 }]);
 
-    it('leaves the target as it was when a non-ASCII target name makes the tools fail', async () => {
-      await createDb(local, 'garde_é', ['CREATE TABLE keep (id INT)', 'INSERT INTO keep VALUES (1)']);
-      const { outcome } = await runSyncForTest(adapter, profileFor('dev_app', 'garde_é'), rootDir);
-      if (outcome.status === 'success') return; // the day the tools handle it, the tests above start failing
-      expect(outcome.status).toBe('failed');
-      expect(await select(local, 'garde_é', 'SELECT id FROM keep')).toEqual([{ id: 1 }]);
-    });
-
-    // KNOWN FAILURE (reported): the tools turn their working folder into a path in the ANSI code page, so a defaults
-    // file under a folder with Japanese characters cannot be opened.
-    (flavor === 'mysql' ? it.fails : it)('works when the data folder has Japanese characters in its name', async () => {
-      const jaRoot = join(workDir, 'データ');
-      const jaAdapter = createMysqlAdapter({ locate, tmpRoot: join(jaRoot, 'tmp') });
-      await createDb(local, 'ja_t', ['CREATE TABLE old (id INT)']);
-      const { outcome } = await runSyncForTest(jaAdapter, profileFor('dev_app', 'ja_t'), jaRoot);
-      expect(outcome, JSON.stringify(outcome)).toMatchObject({ status: 'success' });
-      expect((await snapshot(local, 'ja_t')).customers.length).toBe(2);
-      expect((await fs.readdir(join(jaRoot, 'tmp')).catch(() => [])).filter((f) => f.endsWith('.cnf'))).toEqual([]);
+        const jaRoot = join(workDir, 'データ');
+        const jaAdapter = createMysqlAdapter({ locate, tmpRoot: join(jaRoot, 'tmp') });
+        await createDb(local, 'ja_t', ['CREATE TABLE old (id INT)']);
+        const second = await runSyncForTest(jaAdapter, profileFor('dev_app', 'ja_t'), jaRoot);
+        expect(second.outcome, JSON.stringify(second.outcome)).toMatchObject({ status: 'success' });
+        expect((await snapshot(local, 'ja_t')).customers.length).toBe(2);
+      });
     });
   });
 

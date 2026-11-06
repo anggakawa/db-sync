@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { defaultsFileContent, dumpArgs, loginFileEnv, parseServerVersion, restoreArgs } from '../../src/main/engines/mysql/args';
+import {
+  defaultsFileContent, dumpArgs, hasNonAscii, loginFileEnv, parseServerVersion, restoreArgs, unreadableFolderMessage, unsupportedNameMessage,
+ } from '../../src/main/engines/mysql/args';
 import type { Endpoint } from '../../src/shared/types';
 
 const ep: Endpoint = { host: 'db.example.com', port: 3307, user: 'me', password: 's3cret-pw', database: 'order-db test' };
@@ -88,5 +90,17 @@ describe('tool arguments', () => {
     expect(restoreArgs(ep, FILE, { ...mariadb, pluginDir: 'C:\\plugins' })).toContain('--plugin-dir=C:\\plugins');
     expect(restoreArgs(ep, FILE, { ...mysql, pluginDir: 'C:\\plugins' }).some((a) => a.startsWith('--plugin-dir'))).toBe(false);
     expect(restoreArgs(ep, FILE, mariadb).some((a) => a.startsWith('--plugin-dir'))).toBe(false);
+  });
+});
+
+describe('what the MySQL tools cannot take', () => {
+  it.each([['dev_app', false], ['order-db test', false], ['café', true], ['データ', true], ['d\u00e9v', true]])('%s non-ASCII: %s', (name, expected) => {
+    expect(hasNonAscii(name)).toBe(expected);
+  });
+  it('words the two blockers', () => {
+    expect(unsupportedNameMessage('café')).toBe(
+      "MySQL's command-line tools can't handle the database name café. Rename the database or use one with only English letters and numbers.");
+    expect(unreadableFolderMessage('C:/data')).toBe(
+      "MySQL's command-line tools can't read files in C:/data, usually because the folder name has characters they don't support.");
   });
 });
