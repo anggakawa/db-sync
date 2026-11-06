@@ -16,6 +16,9 @@ export const hasNonAscii = (name: string): boolean => /[^\x00-\x7f]/.test(name);
 export const unsupportedNameMessage = (name: string): string =>
   `MySQL's command-line tools can't handle the database name ${name}. Rename the database or use one with only English letters and numbers.`;
 
+export const undumpableEventMessage = (event: string, database: string): string =>
+  `MySQL's mysqldump can't export the event ${event} in ${database} because its body contains ;;. Rewrite the event, or remove it, then sync again.`;
+
 export const unreadableFolderMessage = (folder: string): string =>
   `MySQL's command-line tools can't read files in ${folder}, usually because the folder name has characters they don't support.`;
 
@@ -37,7 +40,8 @@ function quoted(value: string): string {
 
 /**
  * The password, so it never appears on a command line. It is always written, empty or not: with no value in the
- * file nothing else may supply one. Host, port and user are written here too but also go on the command line.
+ * file nothing else may supply one. The user is only ever here: mysqldump takes non-ASCII argv as raw bytes. Host and
+ * port are written here too but also go on the command line, where a login path cannot override them.
  */
 export function defaultsFileContent(e: { host: string; port: number; user: string; password: string }): string {
   const lines = ['[client]', `host=${quoted(e.host)}`, `port=${e.port}`, `user=${quoted(e.user)}`];

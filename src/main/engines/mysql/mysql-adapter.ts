@@ -14,7 +14,7 @@ import {
 } from '../adapter';
 import { DDL_TIMEOUT_MS, requireEndpoint } from '../limits';
 import {
-  defaultsFileContent, dumpArgs, hasNonAscii, loginFileEnv, parseServerVersion, unreadableFolderMessage, unsupportedNameMessage, restoreArgs, type MysqlFlavor } from './args';
+  defaultsFileContent, dumpArgs, hasNonAscii, loginFileEnv, parseServerVersion, undumpableEventMessage, unreadableFolderMessage, unsupportedNameMessage, restoreArgs, type MysqlFlavor } from './args';
 import {
   connect, endQuietly, ER_DBACCESS_DENIED, ER_LOCK_WAIT_TIMEOUT, ER_SPECIFIC_ACCESS_DENIED, ER_UNKNOWN_SYSTEM_VARIABLE, ER_TABLEACCESS_DENIED, errnoOf,
   guardedQuery as q,
@@ -28,7 +28,12 @@ const DROP_DENIED = new Set([ER_DBACCESS_DENIED, ER_SPECIFIC_ACCESS_DENIED, ER_T
 const NAME_PART = /^[A-Za-z0-9_]+$/;
 
 /** Beyond the adapter interface: what engineChecks needs from the source. */
-interface MysqlSource extends SourceDatabase { nonInnoDbTables(): Promise<Array<{ name: string; engine: string }>> }
+interface MysqlSource extends SourceDatabase {
+  nonInnoDbTables(): Promise<Array<{ name: string; engine: string }>>;
+  /** Events whose body contains ;;, which MySQL 9.7's mysqldump cannot export (it loops forever). */
+  undumpableEvents(): Promise<string[]>;
+}
+interface MysqlTarget extends TargetDatabase { undumpableEvents(): Promise<string[]> }
 
 type Row = Record<string, unknown>;
 
@@ -55,6 +60,16 @@ async function readTables(conn: Connection, database: string): Promise<string[]>
     [database],
   );
   // Sorted here, not by the server, so two servers with different collations agree.
+  return rows.map((r) => String(r.name)).sort();
+}
+
+/** Event names in the schema whose body contains ;;. Empty when the schema does not exist. */
+async function readUndumpableEvents(conn: Connection, database: string): Promise<string[]> {
+  const rows = await q<Row[]>(
+    conn,
+    "SELECT event_name AS name FROM information_schema.events WHERE event_schema = ? AND event_definition LIKE '%;;%'",
+    [database],
+  );
   return rows.map((r) => String(r.name)).sort();
 }
 
@@ -135,7 +150,7 @@ export function createMysqlAdapter(deps: {
       const counter = new Transform({
         transform(chunk: Buffer, _encoding, callback) { bytes += chunk.length; report(bytes); callback(null, chunk); },
       });
-      const written = pipeline(counter, createDefinerFilter(), createGzip(), createWriteStream(dest));
+      const written = pipeline(counter, createDefinerFilter({ database: ep.database }), createGzip(), createWriteStream(dest));
       written.catch(() => undefined); // the tool's own failure is the one to report
       try {
         await runTool({
@@ -256,6 +271,7 @@ export function createMysqlAdapter(deps: {
           );
           return rows.map((r) => ({ name: String(r.name), engine: String(r.engine) }));
         },
+        undumpableEvents: () => readUndumpableEvents(conn, endpoint.database),
         dump: (destPath, ctx) => runDump(conn, endpoint, endpoint.ssl, destPath, 'Downloading from dev', ctx),
         close: () => endQuietly(conn),
       };
@@ -329,9 +345,10 @@ export function createMysqlAdapter(deps: {
         }
       };
 
-      const target: TargetDatabase = {
+      const target: MysqlTarget = {
         kind: 'target',
         ...reads,
+        undumpableEvents: () => readUndumpableEvents(conn, name),
         exists: () => exists(),
         async sizeBytes() {
           if (!(await exists())) return 0;
@@ -385,7 +402,7 @@ export function createMysqlAdapter(deps: {
     },
 
     async engineChecks(source, target): Promise<CheckIssue[]> {
-      if (!('nonInnoDbTables' in source)) {
+      if (!('nonInnoDbTables' in source) || !('undumpableEvents' in target)) {
         throw new Error('The MySQL adapter was given a database that is not from this adapter.');
       }
       const issues: CheckIssue[] = [];
@@ -394,6 +411,12 @@ export function createMysqlAdapter(deps: {
         for (const name of [await source.databaseKey(), await target.databaseKey()]) {
           if (hasNonAscii(name) && !issues.some((i) => i.message.includes(name))) {
             issues.push({ severity: 'blocker', code: 'unsupported-database-name', message: unsupportedNameMessage(name) });
+          }
+        }
+        // The backup of an existing target is a dump too, so its events count as well.
+        for (const [side, database] of [[source as MysqlSource, await source.databaseKey()], [target as MysqlTarget, await target.databaseKey()]] as const) {
+          for (const event of await side.undumpableEvents()) {
+            issues.push({ severity: 'blocker', code: 'event-cannot-be-dumped', message: undumpableEventMessage(event, database) });
           }
         }
         if (!(await toolsCanReadFolder())) {

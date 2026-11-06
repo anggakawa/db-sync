@@ -83,7 +83,7 @@ describe('tool arguments', () => {
     expect(dumpArgs(ep, FILE, { ...mysql, ssl: false })).toContain('--get-server-public-key'); // no TLS: do not rely on the server's auth cache
     expect(dumpArgs(ep, FILE, { ...mysql, ssl: true })).not.toContain('--get-server-public-key');
     expect(dumpArgs(ep, FILE, { ...mariadb, ssl: false })).not.toContain('--get-server-public-key');
-    expect(dumpArgs(ep, FILE, { ...mysql, ssl: false })).toContain('--ssl-mode=DISABLED');
+    expect(dumpArgs(ep, FILE, { ...mysql, ssl: true })).toContain('--ssl-mode=REQUIRED');
     expect(dumpArgs(ep, FILE, { ...mariadb, ssl: true })).toEqual(expect.arrayContaining(['--ssl', '--skip-ssl-verify-server-cert']));
     expect(dumpArgs(ep, FILE, { ...mariadb, ssl: false })).toContain('--skip-ssl');
     for (const o of [mysql, mariadb]) {

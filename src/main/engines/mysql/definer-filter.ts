@@ -14,8 +14,8 @@ const ALTER_DATABASE = /^ALTER DATABASE .* ;;+\r?$/;
  * The dump's own database collation line names the source database. Restored into a database with another name it would
  * fail, and ALTER DATABASE without a name acts on the database the client is connected to.
  */
-const ALTER_DATABASE_NAMED = new RegExp(String.raw`^ALTER DATABASE ${'`(?:[^`]|``)*`'} (CHARACTER SET \w+ COLLATE \w+ ;+\r?)$`);
-/** mysqldump picks a longer delimiter (;;;) when the object body contains ;; */
+const ALTER_DATABASE_NAMED = new RegExp(String.raw`^ALTER DATABASE ${'`((?:[^`]|``)*)`'} (CHARACTER SET \w+ COLLATE \w+ ;+\r?)$`);
+/** The delimiter line. Only ";;" has been seen in real dumps; a longer one is accepted in case mysqldump ever writes it. */
 const DELIMITER_LINE = /^DELIMITER ;;+$/;
 
 const INSERT_PREFIX = Buffer.from('INSERT INTO');
@@ -32,10 +32,12 @@ type Header = 'none' | 'afterDelimiter' | 'afterViewStart';
  * (routine, trigger, event) or right after a view's CREATE ALGORITHM line may carry a definer. Decoded as latin1 so
  * every byte survives the round trip, including ones that are not valid UTF-8; the patterns only match ASCII.
  */
-function processLine(line: Buffer, header: Header): { out: Buffer; next: Header } {
+function processLine(line: Buffer, header: Header, database: string): { out: Buffer; next: Header } {
   const text = line.toString('latin1');
   let next: Header = 'none';
-  let edited = text.replace(ALTER_DATABASE_NAMED, 'ALTER DATABASE $1');
+  // Only the dumped database's own name goes; a statement about another database is left as it is.
+  let edited = text.replace(ALTER_DATABASE_NAMED, (whole, name: string, rest: string) =>
+    (name.replaceAll('``', '`') === database ? `ALTER DATABASE ${rest}` : whole));
   if (header === 'afterDelimiter') {
     if (SESSION_SETTING.test(text) || ALTER_DATABASE.test(text)) next = 'afterDelimiter';
     else if (line.includes(DEFINER_TEXT)) edited = edited.replace(ROUTINE, 'CREATE ').replace(TRIGGER_OR_EVENT, '$1');
@@ -59,7 +61,7 @@ type Mode =
  * Removes DEFINER clauses from mysqldump output so a restore does not need the source's users.
  * Works on bytes and keeps at most one short line in memory, so a huge INSERT line costs nothing extra.
  */
-export function createDefinerFilter(): Transform {
+export function createDefinerFilter(options: { database: string }): Transform {
   let mode: Mode = 'start';
   let pending: Buffer[] = [];
   let pendingLength = 0;
@@ -109,7 +111,7 @@ export function createDefinerFilter(): Transform {
       mode = 'other';
     }
     if (newline) {
-      const done = processLine(pending.length === 1 ? pending[0] : Buffer.concat(pending), header);
+      const done = processLine(pending.length === 1 ? pending[0] : Buffer.concat(pending), header, options.database);
       out.push(done.out);
       header = done.next;
       pending = [];
@@ -140,7 +142,7 @@ export function createDefinerFilter(): Transform {
     },
     flush(callback: TransformCallback) {
       // A last line without a newline.
-      callback(null, pending.length > 0 ? processLine(Buffer.concat(pending), header).out : undefined);
+      callback(null, pending.length > 0 ? processLine(Buffer.concat(pending), header, options.database).out : undefined);
     },
   });
 }

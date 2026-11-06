@@ -125,9 +125,12 @@ async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolea
       const { child, exited } = daemon;
       daemon = undefined;
       try {
-        const root = await rootConnection();
-        await root.query('SHUTDOWN').catch(() => undefined);
-        root.destroy();
+        // Bounded, so a server that does not answer cannot keep stop() from reaching the kill below.
+        const root = await Promise.race([rootConnection(), sleep(10_000).then(() => undefined)]);
+        if (root) {
+          await Promise.race([root.query('SHUTDOWN').catch(() => undefined), sleep(10_000)]);
+          root.destroy();
+        }
       } catch { /* not reachable: fall through to the kill */ }
       const gone = await Promise.race([exited.then(() => true), sleep(30_000).then(() => false)]);
       if (!gone && child.pid !== undefined) await run('taskkill', ['/PID', String(child.pid), '/T', '/F'], 30_000).catch(() => undefined);
@@ -153,7 +156,7 @@ async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolea
     }
     const fast = ['--innodb-buffer-pool-size=64M', '--innodb-flush-log-at-trx-commit=0', '--max-connections=60'];
     const extra = name === 'mysql' ? ['--mysqlx=OFF', '--disable-log-bin'] : ['--skip-log-bin'];
-    // MariaDB has no certificate configured here, so it already runs without TLS.
+    // A server without TLS: MySQL loses its certificates (removed after init) and may not generate new ones; MariaDB is told to skip it.
     if (noTls) extra.push(name === 'mysql' ? '--auto-generate-certs=OFF' : '--skip-ssl');
     // --no-defaults first: the machine's my.ini must not change how a test server runs.
     daemon = spawnDaemon(mysqld, ['--no-defaults', ...common, ...fast, ...extra]);

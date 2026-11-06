@@ -259,7 +259,10 @@ PostgreSQL 15 can't load this dump from dev 17. Upgrade your local image."
   that too (`tools-cannot-read-folder`). Both stop the sync before anything is
   dropped, whether or not a backup is on.
 - **MySQL events containing `;;`:** MySQL 9.7's `mysqldump` loops forever on an event
-  whose body contains `;;`. The download then ends through the 5-minute stall limit.
+  whose body contains `;;`. The check blocks the sync (`event-cannot-be-dumped`)
+  when such an event is in the source database or in an existing target database,
+  because the backup of the target is a dump too. The message names the event.
+  MariaDB's `mariadb-dump` is not affected.
 - **MariaDB ed25519:** an account that signs in with the `ed25519` plugin is not
   supported, because the Node driver has no such plugin. DB Sync says so and asks
   for an account with a different sign-in method.

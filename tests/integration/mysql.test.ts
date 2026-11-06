@@ -177,6 +177,9 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
       expect(got.blobs[0]).toMatchObject({ len: 256 });
       expect(got.blobs[0].hash).toBe((await select(source, 'dev_app', 'SELECT SHA2(data, 256) AS h FROM blobs'))[0].h);
       expect(got.audit.length).toBe(3);
+      // The dump's collation change for the database is restored too (the fixture alters it after creating the events).
+      expect(await select(local, 'copy_t', "SELECT default_collation_name AS c FROM information_schema.schemata WHERE schema_name = 'copy_t'"))
+        .toEqual([{ c: 'utf8mb4_unicode_ci' }]);
       // Text that only looks like a DEFINER clause, in a default, a comment, a routine body and a row with a real newline.
       expect(got.notes[0].body).toBe('a;\nb CREATE DEFINER=`root`@`%` y;\n);\n/*!50013 DEFINER=`a`@`b` SQL SECURITY DEFINER */');
       expect(got.notes[0].tricky).toBe('CREATE DEFINER=`a`@`b` x');
@@ -950,6 +953,55 @@ port=${local.port}
         const s = await adapter.openSource({ ...endpoint(source, 'dev_app'), ssl: false });
         try {
           expect(await adapter.engineChecks(s, t)).toEqual([]); // rootDir is "dá ta sync"
+        } finally {
+          await s.close();
+          await t.close();
+        }
+      });
+    });
+
+    // MySQL 9.7's mysqldump loops forever on an event whose body contains ;;, and a backup of the target is a dump too.
+    // Only Check runs here, so no dump starts and nothing spins.
+    describe('an event with ;; in its body', () => {
+      const event = (name: string) => `CREATE EVENT ${name} ON SCHEDULE EVERY 1 DAY STARTS '2035-01-01 00:00:00' DO SET @x = ';;'`;
+      const message = (name: string, database: string) =>
+        `MySQL's mysqldump can't export the event ${name} in ${database} because its body contains ;;. Rewrite the event, or remove it, then sync again.`;
+
+      it.runIf(flavor === 'mysql')('blocks at Check, in the source or in an existing target, with the target untouched', async () => {
+        await createDb(source, 'ev_src', ['CREATE TABLE t (id INT)', event('src_event'), "CREATE EVENT fine_event ON SCHEDULE EVERY 1 DAY STARTS '2035-01-01 00:00:00' DO SET @x = 1"]);
+        await createDb(local, 'ev_tgt', ['CREATE TABLE keep (id INT)', 'INSERT INTO keep VALUES (1)', event('tgt_event')]);
+
+        const s = await adapter.openSource({ ...endpoint(source, 'ev_src'), ssl: false });
+        const t = await adapter.openTarget(endpoint(local, 'ev_tgt'));
+        try {
+          const issues = (await adapter.engineChecks(s, t)).filter((i) => i.code === 'event-cannot-be-dumped');
+          expect(issues.map((i) => i.severity)).toEqual(['blocker', 'blocker']);
+          expect(issues.map((i) => i.message)).toEqual([message('src_event', 'ev_src'), message('tgt_event', 'ev_tgt')]);
+        } finally {
+          await s.close();
+          await t.close();
+        }
+
+        for (const backupEnabled of [true, false]) {
+          toolRuns.length = 0;
+          const { outcome } = await runSyncForTest(adapter, profileFor('ev_src', 'ev_tgt', { backupEnabled }), rootDir);
+          expect(outcome).toMatchObject({ status: 'failed', step: 'check', targetState: 'untouched' });
+          expect(outcome.status === 'failed' && outcome.details).toContain('event-cannot-be-dumped');
+          expect(outcome.status === 'failed' && outcome.message).toContain(message('src_event', 'ev_src'));
+          expect(outcome.status === 'failed' && outcome.message).toContain(message('tgt_event', 'ev_tgt'));
+          expect(toolRuns.filter((r) => r.args.some((a) => a.startsWith('--port='))).length).toBe(0); // no dump ran
+          expect(await select(local, 'ev_tgt', 'SELECT id FROM keep')).toEqual([{ id: 1 }]);
+          expect((await select(local, 'ev_tgt', 'SELECT event_name AS n FROM information_schema.events WHERE event_schema = DATABASE()')).map((r) => r.n)).toEqual(['tgt_event']);
+        }
+      });
+
+      it.runIf(flavor === 'mariadb')('is not a problem for the MariaDB tools', async () => {
+        await createDb(source, 'ev_src', ['CREATE TABLE t (id INT)', event('src_event')]);
+        await createDb(local, 'ev_tgt', ['CREATE TABLE keep (id INT)', event('tgt_event')]);
+        const s = await adapter.openSource({ ...endpoint(source, 'ev_src'), ssl: false });
+        const t = await adapter.openTarget(endpoint(local, 'ev_tgt'));
+        try {
+          expect((await adapter.engineChecks(s, t)).filter((i) => i.code === 'event-cannot-be-dumped')).toEqual([]);
         } finally {
           await s.close();
           await t.close();

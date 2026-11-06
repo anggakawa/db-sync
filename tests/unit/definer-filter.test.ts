@@ -3,18 +3,18 @@ import { pipeline } from 'node:stream/promises';
 import { describe, expect, it } from 'vitest';
 import { createDefinerFilter } from '../../src/main/engines/mysql/definer-filter';
 
-async function run(chunks: Buffer[]): Promise<Buffer> {
+async function run(chunks: Buffer[], database = 'app'): Promise<Buffer> {
   const out: Buffer[] = [];
-  const filter = createDefinerFilter();
+  const filter = createDefinerFilter({ database });
   filter.on('data', (c: Buffer) => out.push(c));
   await pipeline(Readable.from(chunks, { objectMode: false }), filter);
   return Buffer.concat(out);
 }
-const filterText = async (text: string, chunkSize = Infinity) => {
+const filterText = async (text: string, chunkSize = Infinity, database = 'app') => {
   const buf = Buffer.from(text, 'utf8');
   const chunks: Buffer[] = [];
   for (let i = 0; i < buf.length; i += Math.min(chunkSize, buf.length)) chunks.push(buf.subarray(i, i + chunkSize));
-  return (await run(chunks)).toString('utf8');
+  return (await run(chunks, database)).toString('utf8');
 };
 
 const D = 'DELIMITER ;;\n'; // what mysqldump writes before a routine, trigger or event
@@ -50,15 +50,39 @@ describe('definer filter: object headers', () => {
     expect(await filterText(`${context}${header}\n`, 1)).toBe(want);
   });
 
-  // mysqldump names the source database in these lines; restored into a database with another name they would fail.
+  // mysqldump names the dumped database in these lines; restored into a database with another name they would fail.
   it.each([
-    ['ALTER DATABASE `dev_app` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ;', 'ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ;'],
-    ['ALTER DATABASE `we``ird` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci ;;', 'ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci ;;'],
-  ])('drops the source database name from %s', async (line, expected) => {
+    ['dev_app', 'ALTER DATABASE `dev_app` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ;', 'ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ;'],
+    ['we`ird', 'ALTER DATABASE `we``ird` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci ;;', 'ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci ;;'],
+  ])('drops the dumped database name %s from %s', async (database, line, expected) => {
     for (const eol of ['\n', '\r\n']) {
-      expect(await filterText(`${D}${line}${eol}-- x${eol}`)).toBe(`${D}${expected}${eol}-- x${eol}`);
-      expect(await filterText(`${line}${eol}`, 1)).toBe(`${expected}${eol}`);
+      expect(await filterText(`${D}${line}${eol}-- x${eol}`, Infinity, database)).toBe(`${D}${expected}${eol}-- x${eol}`);
+      expect(await filterText(`${line}${eol}`, 1, database)).toBe(`${expected}${eol}`);
     }
+  });
+
+  // A statement about another database is somebody's SQL, not the dump's own line, wherever it sits.
+  describe('an ALTER DATABASE line naming another database', () => {
+    const other = 'ALTER DATABASE `other_db` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin ;';
+    const mine = 'ALTER DATABASE `app` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin ;';
+    it.each([
+      ['a procedure body', `${D}CREATE PROCEDURE p()\nBEGIN\n${other}\nEND\n`],
+      ['an event body', `${D}/*!50106 CREATE*/ /*!50117 DEFINER=\`a\`@\`b\`*/ /*!50106 EVENT e ON SCHEDULE EVERY 1 DAY DO\nBEGIN\n${other}\nEND\n`],
+      ['a multi-line routine string', `${D}CREATE PROCEDURE p() SELECT 'first\n${other}\nlast';\n`],
+      ['a block comment', `/*\n${other}\n*/\n`],
+      ['the dump itself', `${other}\n`],
+    ])('is unchanged in %s', async (_name, text) => {
+      // Edit what comes out only by the definer rules: these inputs carry none that applies.
+      const expected = text.replace('/*!50117 DEFINER=`a`@`b`*/ ', '');
+      expect(await filterText(text)).toBe(expected);
+      expect(await filterText(text, 1)).toBe(expected);
+    });
+
+    it('is retargeted when it names the dumped database, as the dump\'s own line is', async () => {
+      expect(await filterText(`${D}CREATE PROCEDURE p()\nBEGIN\n${mine}\nEND\n`)).toBe(
+        `${D}CREATE PROCEDURE p()\nBEGIN\nALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_bin ;\nEND\n`,
+      );
+    });
   });
 
   it('leaves an ALTER DATABASE line that is not the dump\'s own shape, and one inside a row, unchanged', async () => {
