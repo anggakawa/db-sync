@@ -13,6 +13,8 @@ export class ToolMissingError extends Error {
 
 export interface ToolLocator {
   path(flavor: Flavor, tool: ToolName): string;
+  /** Folder to pass as --plugin-dir (mariadb client auth plugins); null when the flavor has none. */
+  pluginDir(flavor: Flavor): string | null;
 }
 
 const EXECUTABLES: Record<Flavor, Record<ToolName, string>> = {
@@ -27,6 +29,9 @@ export function createToolLocator(toolsRoot: string): ToolLocator {
       const file = join(toolsRoot, flavor, 'bin', EXECUTABLES[flavor][tool]);
       if (!existsSync(file)) throw new ToolMissingError(file);
       return file;
+    },
+    pluginDir(flavor) {
+      return flavor === 'mariadb' ? join(toolsRoot, flavor, 'lib', 'plugin') : null;
     },
   };
 }

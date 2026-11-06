@@ -67,15 +67,22 @@ async function ensureArchive(entry) {
 }
 
 /** Re-extracts only when the target was not already produced from this archive hash and allowlist. */
-async function extractOnce(archive, entry, dest, allow, strip) {
+async function extractOnce(archive, entry, dest, allow, strip, runtime) {
   const marker = join(dest, '.extracted');
-  const stamp = createHash('sha256').update(JSON.stringify([entry.sha256, allow])).digest('hex');
+  const stamp = createHash('sha256').update(JSON.stringify([entry.sha256, allow, runtime ? [runtime.from, runtime.files] : null])).digest('hex');
   if ((await readFile(marker, 'utf8').catch(() => '')).trim() === stamp) return false;
   await rm(dest, { recursive: true, force: true });
   const written = await extractFiltered(archive, dest, allow, strip);
   if (allow) {
     const missing = allow.filter((n) => !written.includes(n.split('/').slice(strip).join('/')));
     if (missing.length) throw new Error(`${entry.name}: allowlisted files missing from archive: ${missing.join(', ')}`);
+  }
+  if (runtime) {
+    // Runtime DLLs the tools import but their own vendor archive does not ship, taken from another pinned archive.
+    const source = manifest.find((e) => e.name === runtime.from);
+    if (!source) throw new Error(`${entry.name}: runtimeFrom names unknown entry ${runtime.from}`);
+    const copied = await extractFiltered(await ensureArchive(source), dest, runtime.files, 1);
+    if (copied.length !== runtime.files.length) throw new Error(`${entry.name}: runtime files missing from ${runtime.from} archive`);
   }
   await mkdir(dest, { recursive: true });
   await writeFile(marker, `${stamp}\n`);
@@ -87,7 +94,7 @@ for (const entry of manifest) {
   const archive = await ensureArchive(entry);
   if (entry.bundle) {
     const dest = join(root, 'resources', 'tools', entry.flavor);
-    const did = await extractOnce(archive, entry, dest, entry.files, 1);
+    const did = await extractOnce(archive, entry, dest, entry.files, 1, entry.runtimeFrom);
     console.log(`${entry.name}: ${did ? 'extracted' : 'up to date'} -> resources/tools/${entry.flavor}`);
   }
   if (withServers) {

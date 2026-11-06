@@ -5,6 +5,7 @@
     "version": "18.6-5",
     "url": "https://get.enterprisedb.com/postgresql/postgresql-18.6-5-windows-x64-binaries.zip",
     "sha256": "e2246ba91d22345bc3d017586c09ede52d9df180b1eeb480f050445f1cad84e2",
+    "checksumNote": "No vendor-published checksum (EDB publishes none); sha256 is a first-download pin.",
     "bundle": true,
     "files": [
       "pgsql/bin/libcrypto-3-x64.dll",
@@ -17,7 +18,13 @@
       "pgsql/bin/libzstd.dll",
       "pgsql/bin/pg_dump.exe",
       "pgsql/bin/pg_restore.exe"
-    ]
+    ],
+    "runtimeFrom": {
+      "from": "mariadb",
+      "files": [
+        "mariadb-12.3.3-winx64/bin/vcruntime140.dll"
+      ]
+    }
   },
   {
     "name": "mysql",
@@ -25,13 +32,22 @@
     "version": "9.7.4",
     "url": "https://cdn.mysql.com/Downloads/MySQL-9.7/mysql-9.7.4-winx64.zip",
     "sha256": "641bdaf01004927194c561b956f14f915a3166c9b0f9b1b5464ae63152bf4b96",
+    "checksumNote": "Matches the vendor-published .md5 on cdn.mysql.com (MD5 only); sha256 computed from the download.",
     "bundle": true,
     "files": [
       "mysql-9.7.4-winx64/bin/libcrypto-3-x64.dll",
       "mysql-9.7.4-winx64/bin/libssl-3-x64.dll",
       "mysql-9.7.4-winx64/bin/mysql.exe",
       "mysql-9.7.4-winx64/bin/mysqldump.exe"
-    ]
+    ],
+    "runtimeFrom": {
+      "from": "mariadb",
+      "files": [
+        "mariadb-12.3.3-winx64/bin/vcruntime140.dll",
+        "mariadb-12.3.3-winx64/bin/vcruntime140_1.dll",
+        "mariadb-12.3.3-winx64/bin/msvcp140.dll"
+      ]
+    }
   },
   {
     "name": "mariadb",
@@ -39,13 +55,16 @@
     "version": "12.3.3",
     "url": "https://archive.mariadb.org/mariadb-12.3.3/winx64-packages/mariadb-12.3.3-winx64.zip",
     "sha256": "4b5706b47148b47c8f36963c8352d1ddee37a1287b4690428f631a74b09b85a0",
+    "checksumNote": "Matches the vendor-published sha256sums.txt on archive.mariadb.org.",
     "bundle": true,
     "files": [
       "mariadb-12.3.3-winx64/bin/mariadb-dump.exe",
       "mariadb-12.3.3-winx64/bin/mariadb.exe",
       "mariadb-12.3.3-winx64/bin/msvcp140.dll",
       "mariadb-12.3.3-winx64/bin/vcruntime140.dll",
-      "mariadb-12.3.3-winx64/bin/vcruntime140_1.dll"
+      "mariadb-12.3.3-winx64/bin/vcruntime140_1.dll",
+      "mariadb-12.3.3-winx64/lib/plugin/client_ed25519.dll",
+      "mariadb-12.3.3-winx64/lib/plugin/caching_sha2_password.dll"
     ]
   },
   {
@@ -54,6 +73,7 @@
     "version": "14.24-4",
     "url": "https://get.enterprisedb.com/postgresql/postgresql-14.24-4-windows-x64-binaries.zip",
     "sha256": "8d5b5aef56848dbd0562e5e02d613eb5cbc7d97cae10b290cbfdabf1b4969088",
+    "checksumNote": "No vendor-published checksum (EDB publishes none); sha256 is a first-download pin.",
     "bundle": false,
     "files": []
   }

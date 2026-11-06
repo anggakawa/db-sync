@@ -32,4 +32,11 @@ describe('createToolLocator', () => {
     expect(() => locator.path('mysql', 'dump')).toThrow(ToolMissingError);
     expect(() => locator.path('mysql', 'dump')).toThrow(/mysqldump\.exe/);
   });
+
+  it("pluginDir is the mariadb lib/plugin folder and null for other flavors", () => {
+    const locator = createToolLocator(root);
+    expect(locator.pluginDir("mariadb")).toBe(join(root, "mariadb", "lib", "plugin"));
+    expect(locator.pluginDir("mysql")).toBeNull();
+    expect(locator.pluginDir("postgres")).toBeNull();
+  });
 });
