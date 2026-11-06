@@ -1,16 +1,22 @@
 import { promises as fs } from 'node:fs';
 import type { TargetState } from '../../shared/types';
 import type { CreateOptions, StepContext, TargetDatabase } from '../engines/adapter';
-import type { Journal } from './journal';
+import type { Journal, TargetId } from './journal';
 import type { SyncPaths } from './paths';
 
-export interface StoredBackup { path: string; createOptions: CreateOptions }
+export interface StoredBackup { path: string; createOptions: CreateOptions; target?: TargetId }
+
+/** Exact comparison. A missing record (an old file) never matches. */
+export const sameTarget = (recorded: TargetId | undefined, now: TargetId): boolean =>
+  !!recorded && recorded.host === now.host && recorded.port === now.port && recorded.database === now.database;
+export const describeTarget = (t: TargetId | undefined): string =>
+  (t ? `${t.host}:${t.port}/${t.database}` : 'the target used before');
 
 /** Reads the backup's metadata and checks the backup exists. Throws before anything is changed. */
 export async function loadBackup(paths: SyncPaths, id: string): Promise<StoredBackup> {
-  const meta = JSON.parse(await fs.readFile(paths.backupMeta(id), 'utf8')) as { createOptions?: CreateOptions };
+  const meta = JSON.parse(await fs.readFile(paths.backupMeta(id), 'utf8')) as { createOptions?: CreateOptions; target?: TargetId };
   await fs.stat(paths.backupLatest(id));
-  return { path: paths.backupLatest(id), createOptions: meta.createOptions ?? {} };
+  return { path: paths.backupLatest(id), createOptions: meta.createOptions ?? {}, target: meta.target };
 }
 
 /** Drops the target, creates it with the stored options and restores the backup. The backup is kept. */

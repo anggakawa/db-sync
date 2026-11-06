@@ -15,7 +15,7 @@ const COPY: Record<SyncStep, { what: string; next: string }> = {
 const isOlder = (a: [number, number], b: [number, number]) => a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
 
 export function describeFailure(
-  step: SyncStep, error: unknown, source: ServerInfo | null, target: ServerInfo | null,
+  step: SyncStep, error: unknown, source: ServerInfo | null, target: ServerInfo | null, nextAction?: string,
 ): { message: string; details: string } {
   const tool = error instanceof ToolError ? error : null;
   const details = tool
@@ -30,6 +30,15 @@ export function describeFailure(
   }
   const lastLine = tool ? tool.stderrTail.trim().split(/\r?\n/).filter(Boolean).pop() : undefined;
   const reason = (lastLine ?? (error instanceof Error ? error.message : String(error))).replace(/[.\s]+$/, '');
-  const { what, next } = COPY[step];
+  const { what } = COPY[step];
+  const next = nextAction ?? COPY[step].next;
   return { message: `${what} failed: ${reason}. ${next}`, details };
+}
+
+
+/** A short cause for a message: the last line a tool printed, or the error text. */
+export function causeOf(error: unknown): string {
+  const tool = error instanceof ToolError ? error : null;
+  const last = tool ? tool.stderrTail.trim().split(/\r?\n/).filter(Boolean).pop() : undefined;
+  return (last ?? (error instanceof Error ? error.message : String(error))).replace(/[.\s]+$/, '');
 }

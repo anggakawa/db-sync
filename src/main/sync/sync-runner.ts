@@ -1,14 +1,14 @@
 import { promises as fs } from 'node:fs';
 import type { CheckIssue, Engine, Profile, SyncEvent, SyncOutcome, SyncStep, TargetState } from '../../shared/types';
 import {
-  DropBlockedError, type CreateOptions, type EngineAdapter, type SourceDatabase, type StepContext, type TargetDatabase,
+  DropBlockedError, type CreateOptions, type EngineAdapter, type ServerInfo, type SourceDatabase, type StepContext, type TargetDatabase,
 } from '../engines/adapter';
 import type { GuardResult } from '../safety/target-guard';
 import { runChecks } from './checks';
-import { describeFailure } from './failure-copy';
-import { clearJournal, readJournal, writeJournal, type Journal } from './journal';
+import { causeOf, describeFailure } from './failure-copy';
+import { clearJournal, readJournal, writeJournal, type Journal, type TargetId } from './journal';
 import type { SyncPaths } from './paths';
-import { applyBackup, loadBackup, recoverTarget, recoveryTouchesTarget } from './recovery';
+import { applyBackup, describeTarget, loadBackup, recoverTarget, recoveryTouchesTarget, sameTarget } from './recovery';
 import { sizeOf, watchStall } from './stall-watch';
 
 export interface RunnerDeps {
@@ -34,7 +34,7 @@ class StepFailure extends Error {
 /** Never rejects: a removal that fails (EBUSY, EPERM) is logged and the run carries on. Backups may be directories. */
 async function removeQuietly(path: string, onLog?: (line: string) => void): Promise<void> {
   try {
-    await fs.rm(path, { recursive: true, force: true });
+    await fs.rm(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   } catch (err) {
     onLog?.(`Could not remove ${path}: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -45,6 +45,15 @@ const stallText = (ms: number) =>
   (ms >= 60_000 ? `${Math.round(ms / 60_000)} minute(s)` : `${Math.max(1, Math.round(ms / 1000))} second(s)`);
 const blockedMessage = (clients: string[]) =>
   `Other programs are connected to the local database (${clients.join(', ')}). Close them and try again. Nothing was deleted.`;
+
+const targetOf = (p: Profile): TargetId => ({ host: p.target.host, port: p.target.port, database: p.target.database });
+const mismatchMessage = (recorded: TargetId | undefined) =>
+  `This profile's target changed after the last sync. Change it back to ${describeTarget(recorded)} to recover your local data.`;
+const NEXT = 'Close other programs using this database, check the local server is running, then choose Recover.';
+const recoveryFailedMessage = (cause: string, backupPath: string | undefined, partial: boolean) =>
+  partial
+    ? `Could not remove the partial local database: ${cause}. ${NEXT}`
+    : `Could not restore your previous local data: ${cause}. ${NEXT}${backupPath ? ` Your backup is kept at ${backupPath}.` : ''}`;
 
 export function createSyncRunner(deps: RunnerDeps) {
   const now = deps.now ?? Date.now;
@@ -82,6 +91,9 @@ export function createSyncRunner(deps: RunnerDeps) {
     let backupPath: string | undefined;
     let source: SourceDatabase | undefined;
     let target: TargetDatabase | undefined;
+    let sourceInfo: ServerInfo | null = null;
+    let targetInfo: ServerInfo | null = null;
+    const here = targetOf(profile);
 
     const enter = (next: SyncStep) => {
       cb.signal.throwIfAborted();
@@ -95,9 +107,18 @@ export function createSyncRunner(deps: RunnerDeps) {
       const guard = await deps.checkTarget(profile.target.host);
       if (!guard.allowed) throw new StepFailure('check', guard.reason, 'target-not-local');
 
+      // An unfinished earlier run owns the backup: keep it, and keep its journal flags.
+      const pending = await readJournal(paths, id);
+      if (pending && !sameTarget(pending.target, here)) {
+        throw new StepFailure('check', mismatchMessage(pending.target), 'target-changed');
+      }
+
       const adapter = deps.adapterFor(profile.engine);
       source = await adapter.openSource(profile.source);
       target = await adapter.openTarget(profile.target);
+      // Kept for the failure messages, so wording one never waits on a query.
+      sourceInfo = await source.info();
+      targetInfo = await target.info();
       await fs.mkdir(paths.tmpRoot, { recursive: true });
 
       const issues = await runChecks(profile, source, target, adapter, {
@@ -135,9 +156,11 @@ export function createSyncRunner(deps: RunnerDeps) {
       }
 
       const targetExists = await target.exists();
-      if (profile.backupEnabled && targetExists) {
+      if (pending) {
+        if (pending.backupAvailable) backupPath = paths.backupLatest(id);
+      } else if (profile.backupEnabled && targetExists) {
         enter('backup');
-        await takeBackup(id, target, ctx);
+        await takeBackup(id, target, ctx, here);
         backupPath = paths.backupLatest(id);
       }
 
@@ -147,8 +170,9 @@ export function createSyncRunner(deps: RunnerDeps) {
       if (!again.allowed) throw new StepFailure('replace', again.reason, 'target-not-local');
       cb.signal.throwIfAborted();
       journal = {
-        profileId: id, hadTarget: targetExists, backupAvailable: backupPath !== undefined,
-        startedAt: new Date(now()).toISOString(),
+        profileId: id, startedAt: new Date(now()).toISOString(), target: here,
+        hadTarget: pending ? pending.hadTarget : targetExists,
+        backupAvailable: pending ? pending.backupAvailable : backupPath !== undefined,
       };
       await writeJournal(paths, journal);
       // From here the target may change; only a blocked drop proves nothing was deleted.
@@ -198,8 +222,7 @@ export function createSyncRunner(deps: RunnerDeps) {
         } else if (err instanceof DropBlockedError) {
           failure = { step, message: blockedMessage(err.clients), details: `Connected clients: ${err.clients.join(', ')}` };
         } else {
-          const info = (db: SourceDatabase | TargetDatabase | undefined) => (db ? db.info().catch(() => null) : Promise.resolve(null));
-          failure = { step, ...describeFailure(step, err, await info(source), await info(target)) };
+          failure = { step, ...describeFailure(step, err, sourceInfo, targetInfo) };
         }
       }
 
@@ -214,7 +237,7 @@ export function createSyncRunner(deps: RunnerDeps) {
         } catch (recErr) {
           return {
             status: 'failed', step: 'replace', targetState: 'recovery-failed', ...keep,
-            message: `The sync failed and the previous local data could not be restored automatically.${backupPath ? ` Your backup is kept at ${backupPath}.` : ''}`,
+            message: recoveryFailedMessage(causeOf(recErr), journal.backupAvailable ? paths.backupLatest(id) : undefined, !journal.backupAvailable && !journal.hadTarget),
             details: `${failure?.details ?? 'The sync was cancelled.'}\n\nRecovery failed: ${errText(recErr)}`,
           };
         }
@@ -228,7 +251,7 @@ export function createSyncRunner(deps: RunnerDeps) {
   }
 
   /** Writes the backup beside the current one and swaps it in only after it completes. */
-  async function takeBackup(id: string, target: TargetDatabase, ctx: StepContext): Promise<void> {
+  async function takeBackup(id: string, target: TargetDatabase, ctx: StepContext, here: TargetId): Promise<void> {
     const options: CreateOptions = await target.createOptions();
     await fs.mkdir(paths.backupDir(id), { recursive: true });
     await removeQuietly(paths.backupIncoming(id), ctx.onLog);
@@ -241,7 +264,7 @@ export function createSyncRunner(deps: RunnerDeps) {
     // Recovery reads meta.json, so it is written whole or not at all: temp file first, renamed after the swap.
     const metaTmp = `${paths.backupMeta(id)}.tmp`;
     try {
-      await fs.writeFile(metaTmp, JSON.stringify({ createOptions: options, takenAt: now() }));
+      await fs.writeFile(metaTmp, JSON.stringify({ createOptions: options, takenAt: now(), target: here }));
     } catch (e) {
       await removeQuietly(metaTmp, ctx.onLog);
       await removeQuietly(paths.backupIncoming(id), ctx.onLog);
@@ -281,24 +304,40 @@ export function createSyncRunner(deps: RunnerDeps) {
   /** Restores the kept backup over the target. Takes no new backup and keeps the old one. */
   async function restoreBackup(profile: Profile, cb: RunCallbacks): Promise<SyncOutcome> {
     const startedAt = now();
+    const id = profile.id;
+    const here = targetOf(profile);
     const ctx = contextFor(cb, cb.signal);
     let target: TargetDatabase | undefined;
     let touched = false;
     let backupPath: string | undefined;
     try {
       cb.onEvent({ type: 'step', step: 'replace' });
-      const backup = await loadBackup(paths, profile.id);
+      const earlier = await readJournal(paths, id);
+      if (earlier && !sameTarget(earlier.target, here)) return failed(mismatchMessage(earlier.target), 'target-changed', 'untouched');
+      const backup = await loadBackup(paths, id);
       backupPath = backup.path;
+      if (!sameTarget(backup.target, here)) {
+        return failed(
+          `The saved backup belongs to ${describeTarget(backup.target)}, not this profile's target. Change the target back to restore it.`,
+          'backup-target-mismatch', 'untouched', backupPath,
+        );
+      }
       await ensureLocal(profile.target.host);
       target = await deps.adapterFor(profile.engine).openTarget(profile.target);
       cb.signal.throwIfAborted();
+      // Kept on failure or cancel, so Recover can run the same restore again.
+      await writeJournal(paths, { profileId: id, hadTarget: true, backupAvailable: true, startedAt: new Date(now()).toISOString(), target: here });
       touched = true;
       try {
         await applyBackup(target, backup, ctx);
       } catch (err) {
-        if (err instanceof DropBlockedError) touched = false;
+        if (err instanceof DropBlockedError) {
+          touched = false;
+          await clearJournalQuietly(id, ctx.onLog);
+        }
         throw err;
       }
+      await clearJournalQuietly(id, ctx.onLog);
       return { status: 'success', durationMs: now() - startedAt, warnings: [], targetState: 'restored-from-backup' };
     } catch (err) {
       const targetState: TargetState = touched ? 'maybe-incomplete' : 'untouched';
@@ -306,7 +345,7 @@ export function createSyncRunner(deps: RunnerDeps) {
       if (err instanceof DropBlockedError) {
         return failed(blockedMessage(err.clients), `Connected clients: ${err.clients.join(', ')}`, targetState, backupPath);
       }
-      const d = describeFailure('replace', err, null, null);
+      const d = describeFailure('replace', err, null, null, 'Choose Restore previous local data to run the restore again.');
       return failed(backupPath ? d.message : 'There is no previous local data to restore.', d.details, targetState, backupPath);
     } finally {
       await closeAll([target], ctx.onLog);
@@ -319,27 +358,29 @@ export function createSyncRunner(deps: RunnerDeps) {
     const id = profile.id;
     const ctx = contextFor(cb, new AbortController().signal); // recovery is not cancellable
     let target: TargetDatabase | undefined;
-    let backupPath: string | undefined;
+    let journal: Journal | null = null;
     try {
-      const journal = await readJournal(paths, id);
+      journal = await readJournal(paths, id);
       if (!journal) return failed('There is no unfinished sync to recover.', 'no-journal', 'untouched');
-      if (journal.backupAvailable) backupPath = paths.backupLatest(id);
+      if (!sameTarget(journal.target, targetOf(profile))) return failed(mismatchMessage(journal.target), 'target-changed', 'untouched');
       cb.onEvent({ type: 'step', step: 'replace' });
-      if (recoveryTouchesTarget(journal)) await ensureLocal(profile.target.host);
+      if (!recoveryTouchesTarget(journal)) {
+        await clearJournalQuietly(id, ctx.onLog);
+        return failed(
+          'The sync was interrupted and the local database may be incomplete. Run a sync again to replace it.',
+          'The backup was turned off, so there is nothing to restore.', 'maybe-incomplete',
+        );
+      }
+      await ensureLocal(profile.target.host);
       target = await deps.adapterFor(profile.engine).openTarget(profile.target);
       const rec = await recoverTarget(target, journal, paths, ctx);
       await clearJournalQuietly(id, ctx.onLog);
-      if (rec.targetState === 'restored-from-backup' || rec.targetState === 'removed-partial') {
-        return { status: 'success', durationMs: now() - startedAt, warnings: [], targetState: rec.targetState };
-      }
-      return failed(
-        'The sync was interrupted and the local database may be incomplete. Run a sync again to replace it.',
-        'The backup was turned off, so there is nothing to restore.', 'maybe-incomplete',
-      );
+      return { status: 'success', durationMs: now() - startedAt, warnings: [], targetState: rec.targetState as 'restored-from-backup' | 'removed-partial' };
     } catch (err) {
+      const backupPath = journal?.backupAvailable ? paths.backupLatest(id) : undefined;
       return {
         status: 'failed', step: 'replace', targetState: 'recovery-failed', ...(backupPath && { backupPath }),
-        message: `The previous local data could not be restored automatically.${backupPath ? ` Your backup is kept at ${backupPath}.` : ''}`,
+        message: recoveryFailedMessage(causeOf(err), backupPath, !!journal && !journal.backupAvailable && !journal.hadTarget),
         details: describeFailure('replace', err, null, null).details,
       };
     } finally {

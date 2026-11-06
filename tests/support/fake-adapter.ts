@@ -51,6 +51,7 @@ export function createFakeAdapter(overrides: Partial<FakeConfig> = {}) {
   };
   const calls: string[] = [];
   const created: CreateOptions[] = [];
+  const restoredPaths: string[] = [];
   const opens: string[] = [];
   const closes: string[] = [];
 
@@ -83,7 +84,7 @@ export function createFakeAdapter(overrides: Partial<FakeConfig> = {}) {
     canCreateDatabase: async () => config.canCreate,
     dropDatabase: async (_ctx: StepContext) => step('target.dropDatabase'),
     createDatabase: async (options: CreateOptions) => { created.push(options); await step('target.createDatabase'); },
-    restore: async (_path: string, _ctx: StepContext) => step('target.restore'),
+    restore: async (path: string, _ctx: StepContext) => { restoredPaths.push(path); await step('target.restore'); },
     close: async () => { closes.push('target'); },
   };
   const adapter: EngineAdapter = {
@@ -91,5 +92,5 @@ export function createFakeAdapter(overrides: Partial<FakeConfig> = {}) {
     openTarget: async (_e: Endpoint) => { opens.push('target'); return target; },
     engineChecks: async () => config.engineIssues,
   };
-  return { adapter, config, calls, created, opens, closes };
+  return { adapter, config, calls, created, restoredPaths, opens, closes };
 }

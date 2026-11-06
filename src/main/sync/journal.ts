@@ -2,7 +2,8 @@ import { promises as fs } from 'node:fs';
 import { dirname } from 'node:path';
 import type { SyncPaths } from './paths';
 
-export interface Journal { profileId: string; hadTarget: boolean; backupAvailable: boolean; startedAt: string }
+export interface TargetId { host: string; port: number; database: string }
+export interface Journal { profileId: string; hadTarget: boolean; backupAvailable: boolean; startedAt: string; target: TargetId }
 
 /** Written atomically (temp file, then rename) so a crash never leaves a half-written journal. */
 export async function writeJournal(paths: SyncPaths, j: Journal): Promise<void> {
@@ -28,5 +29,5 @@ export async function readJournal(paths: SyncPaths, id: string): Promise<Journal
 }
 
 export async function clearJournal(paths: SyncPaths, id: string): Promise<void> {
-  await fs.rm(paths.journal(id), { force: true });
+  await fs.rm(paths.journal(id), { force: true, maxRetries: 3, retryDelay: 100 });
 }
