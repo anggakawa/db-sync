@@ -186,27 +186,27 @@ describe('sync runner', () => {
     await ok.runner.sync(profile, ok.callbacks());
     expect(await exists(paths.tmpDump(profile.id))).toBe(false);
 
-    const bad = setup({ failures: { 'target.restore': new Error('boom') } });
+    const bad = setup({ failuresOnce: { 'target.restore': new Error('boom') } });
     const out = await bad.runner.sync(profile, bad.callbacks());
-    expect(out).toMatchObject({ status: 'failed', step: 'replace', message: 'boom' });
+    expect(out).toMatchObject({ status: 'failed', step: 'replace', message: expect.stringContaining('boom') });
     expect(await exists(paths.tmpDump(profile.id))).toBe(false);
     expect(await readdir(paths.tmpRoot)).toEqual([]);
   });
 
-  it('reports a failure after the drop as maybe-incomplete', async () => {
-    const { runner, callbacks } = setup({ failures: { 'target.createDatabase': new Error('boom') } });
-    expect(await runner.sync(profile, callbacks())).toMatchObject({ status: 'failed', step: 'replace', targetState: 'maybe-incomplete' });
+  it('reports a failure after the drop as maybe-incomplete when recovery has no backup', async () => {
+    const { runner, callbacks } = setup({ failuresOnce: { 'target.createDatabase': new Error('boom') } });
+    expect(await runner.sync({ ...profile, backupEnabled: false }, callbacks())).toMatchObject({ status: 'failed', step: 'replace', targetState: 'maybe-incomplete' });
   });
 
-  it('reports a failed first-sync create as maybe-incomplete', async () => {
-    const { runner, callbacks } = setup({ targetExists: false, targetTables: [], failures: { 'target.createDatabase': new Error('x') } });
-    expect(await runner.sync(profile, callbacks())).toMatchObject({ status: 'failed', targetState: 'maybe-incomplete' });
+  it('removes the partial database after a failed first-sync create', async () => {
+    const { runner, callbacks } = setup({ targetExists: false, targetTables: [], failuresOnce: { 'target.createDatabase': new Error('x') } });
+    expect(await runner.sync(profile, callbacks())).toMatchObject({ status: 'failed', targetState: 'removed-partial' });
   });
 
-  it('reports an unexpected drop error as maybe-incomplete', async () => {
-    const { runner, callbacks } = setup({ failures: { 'target.dropDatabase': new Error('connection lost') } });
-    expect(await runner.sync(profile, callbacks())).toMatchObject({
-      status: 'failed', step: 'replace', message: 'connection lost', targetState: 'maybe-incomplete',
+  it('reports an unexpected drop error as maybe-incomplete when recovery has no backup', async () => {
+    const { runner, callbacks } = setup({ failuresOnce: { 'target.dropDatabase': new Error('connection lost') } });
+    expect(await runner.sync({ ...profile, backupEnabled: false }, callbacks())).toMatchObject({
+      status: 'failed', step: 'replace', message: expect.stringContaining('connection lost'), targetState: 'maybe-incomplete',
     });
   });
 
@@ -225,9 +225,9 @@ describe('sync runner', () => {
       if (String(path) === paths.tmpDump(profile.id)) throw Object.assign(new Error('busy'), { code: 'EBUSY' });
       return realRm(path, opts);
     });
-    const { fake, runner, events, callbacks } = setup({ failures: { 'target.restore': new Error('real error') } });
+    const { fake, runner, events, callbacks } = setup({ failuresOnce: { 'target.restore': new Error('real error') } });
     const out = await runner.sync(profile, callbacks());
-    expect(out).toMatchObject({ status: 'failed', step: 'replace', message: 'real error' });
+    expect(out).toMatchObject({ status: 'failed', step: 'replace', message: expect.stringContaining('real error') });
     expect(fake.closes.sort()).toEqual(['source', 'target']);
     expect(events.some((e) => e.type === 'log' && e.line.includes('busy'))).toBe(true);
   });
@@ -310,9 +310,4 @@ describe('sync runner', () => {
     }
   });
 
-  it('declares restoreBackup and recover as not implemented', () => {
-    const { runner, callbacks } = setup();
-    expect(() => runner.restoreBackup(profile, callbacks())).toThrow('not implemented');
-    expect(() => runner.recover(profile, callbacks())).toThrow('not implemented');
-  });
 });

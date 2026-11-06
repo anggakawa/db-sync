@@ -21,6 +21,8 @@ export interface FakeConfig {
   engineIssues: CheckIssue[];
   /** Methods that throw when called. */
   failures: Partial<Record<FakeMethod, Error>>;
+  /** Methods that throw on their first call only. */
+  failuresOnce: Partial<Record<FakeMethod, Error>>;
   /** Runs inside a method, after it is recorded and before it finishes. */
   hooks: Partial<Record<FakeMethod, () => void | Promise<void>>>;
 }
@@ -43,6 +45,7 @@ export function createFakeAdapter(overrides: Partial<FakeConfig> = {}) {
     targetCreateOptions: { encoding: 'LATIN1' },
     engineIssues: [],
     failures: {},
+    failuresOnce: {},
     hooks: {},
     ...overrides,
   };
@@ -54,7 +57,8 @@ export function createFakeAdapter(overrides: Partial<FakeConfig> = {}) {
   const step = async (name: FakeMethod, destPath?: string) => {
     calls.push(name);
     await config.hooks[name]?.();
-    const failure = config.failures[name];
+    const failure = config.failuresOnce[name] ?? config.failures[name];
+    delete config.failuresOnce[name];
     if (failure) throw failure;
     if (destPath) await fs.writeFile(destPath, name);
   };
