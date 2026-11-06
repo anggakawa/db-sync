@@ -1,0 +1,60 @@
+[
+  {
+    "name": "postgres",
+    "flavor": "postgres",
+    "version": "18.6-5",
+    "url": "https://get.enterprisedb.com/postgresql/postgresql-18.6-5-windows-x64-binaries.zip",
+    "sha256": "e2246ba91d22345bc3d017586c09ede52d9df180b1eeb480f050445f1cad84e2",
+    "bundle": true,
+    "files": [
+      "pgsql/bin/libcrypto-3-x64.dll",
+      "pgsql/bin/libiconv-2.dll",
+      "pgsql/bin/libintl-9.dll",
+      "pgsql/bin/liblz4.dll",
+      "pgsql/bin/libpq.dll",
+      "pgsql/bin/libssl-3-x64.dll",
+      "pgsql/bin/libwinpthread-1.dll",
+      "pgsql/bin/libzstd.dll",
+      "pgsql/bin/pg_dump.exe",
+      "pgsql/bin/pg_restore.exe"
+    ]
+  },
+  {
+    "name": "mysql",
+    "flavor": "mysql",
+    "version": "9.7.4",
+    "url": "https://cdn.mysql.com/Downloads/MySQL-9.7/mysql-9.7.4-winx64.zip",
+    "sha256": "641bdaf01004927194c561b956f14f915a3166c9b0f9b1b5464ae63152bf4b96",
+    "bundle": true,
+    "files": [
+      "mysql-9.7.4-winx64/bin/libcrypto-3-x64.dll",
+      "mysql-9.7.4-winx64/bin/libssl-3-x64.dll",
+      "mysql-9.7.4-winx64/bin/mysql.exe",
+      "mysql-9.7.4-winx64/bin/mysqldump.exe"
+    ]
+  },
+  {
+    "name": "mariadb",
+    "flavor": "mariadb",
+    "version": "12.3.3",
+    "url": "https://archive.mariadb.org/mariadb-12.3.3/winx64-packages/mariadb-12.3.3-winx64.zip",
+    "sha256": "4b5706b47148b47c8f36963c8352d1ddee37a1287b4690428f631a74b09b85a0",
+    "bundle": true,
+    "files": [
+      "mariadb-12.3.3-winx64/bin/mariadb-dump.exe",
+      "mariadb-12.3.3-winx64/bin/mariadb.exe",
+      "mariadb-12.3.3-winx64/bin/msvcp140.dll",
+      "mariadb-12.3.3-winx64/bin/vcruntime140.dll",
+      "mariadb-12.3.3-winx64/bin/vcruntime140_1.dll"
+    ]
+  },
+  {
+    "name": "postgres-old",
+    "flavor": "postgres",
+    "version": "14.24-4",
+    "url": "https://get.enterprisedb.com/postgresql/postgresql-14.24-4-windows-x64-binaries.zip",
+    "sha256": "8d5b5aef56848dbd0562e5e02d613eb5cbc7d97cae10b290cbfdabf1b4969088",
+    "bundle": false,
+    "files": []
+  }
+]
