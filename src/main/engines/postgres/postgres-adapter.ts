@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import type { Client } from 'pg';
 import type { CheckIssue, Endpoint, SourceEndpoint } from '../../../shared/types';
 import { runTool } from '../../process/process-runner';
-import type { ToolLocator } from '../../tools/tool-locator';
+import { usesOlderPostgresTools, type ToolLocator } from '../../tools/tool-locator';
 import {
   DropBlockedError, type CreateOptions, type EngineAdapter, type ServerInfo, type SourceDatabase, type StepContext,
   type TargetDatabase,
@@ -227,13 +227,24 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
       if (!('extensionNames' in source) || !('availableExtensions' in target)) {
         throw new Error('The PostgreSQL adapter was given a database that is not from this adapter.');
       }
+      const issues: CheckIssue[] = [];
+      // The newest pg_dump writes an archive the older pg_restore can't read, and it would only fail after the drop.
+      const s = await source.info();
+      const t = await target.info();
+      if (!usesOlderPostgresTools(s.version[0]) && usesOlderPostgresTools(t.version[0])) {
+        issues.push({
+          severity: 'blocker', code: 'target-too-old',
+          message: `Local PostgreSQL ${t.versionLabel} can't load this dump from dev ${s.versionLabel}. Upgrade your local image.`,
+        });
+      }
       const used = await (source as PostgresSource).extensionNames();
       const available = await (target as PostgresTarget).availableExtensions();
-      return missingExtensions(used, available).map((ext) => ({
+      issues.push(...missingExtensions(used, available).map((ext) => ({
         severity: 'blocker' as const,
         code: 'missing-extension',
         message: `Dev uses the "${ext}" extension, which is not installed on the local server. Install it, then try again.`,
-      }));
+      })));
+      return issues;
     },
   };
 }

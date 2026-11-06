@@ -45,7 +45,7 @@ describe('createToolLocator PostgreSQL majors', () => {
   let root: string;
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'dbsync-tools-'));
-    for (const dir of ['postgres', 'postgres-14']) {
+    for (const dir of ['postgres', 'postgres-16']) {
       mkdirSync(join(root, dir, 'bin'), { recursive: true });
       writeFileSync(join(root, dir, 'bin', 'pg_dump.exe'), '');
     }
@@ -57,9 +57,9 @@ describe('createToolLocator PostgreSQL majors', () => {
     [18, 'postgres'],
     [19, 'postgres'],
     [17, 'postgres'],
-    [15, 'postgres'],
-    [14, 'postgres-14'],
-    [13, 'postgres-14'],
+    [16, 'postgres-16'],
+    [15, 'postgres-16'],
+    [14, 'postgres-16'],
   ])('uses the %s server tools from %s', (major, dir) => {
     expect(createToolLocator(root).path('postgres', 'dump', major)).toBe(join(root, dir, 'bin', 'pg_dump.exe'));
   });

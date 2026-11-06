@@ -71,30 +71,12 @@
   {
     "name": "postgres-old",
     "flavor": "postgres",
-    "dest": "postgres-14",
     "version": "14.24-4",
     "url": "https://get.enterprisedb.com/postgresql/postgresql-14.24-4-windows-x64-binaries.zip",
     "sha256": "8d5b5aef56848dbd0562e5e02d613eb5cbc7d97cae10b290cbfdabf1b4969088",
     "checksumNote": "No vendor-published checksum (EDB publishes none); sha256 is a first-download pin.",
-    "bundle": true,
-    "files": [
-      "pgsql/bin/libcrypto-1_1-x64.dll",
-      "pgsql/bin/libiconv-2.dll",
-      "pgsql/bin/libintl-9.dll",
-      "pgsql/bin/liblz4.dll",
-      "pgsql/bin/libpq.dll",
-      "pgsql/bin/libssl-1_1-x64.dll",
-      "pgsql/bin/libwinpthread-1.dll",
-      "pgsql/bin/zlib1.dll",
-      "pgsql/bin/pg_dump.exe",
-      "pgsql/bin/pg_restore.exe"
-    ],
-    "runtimeFrom": {
-      "from": "mariadb",
-      "files": [
-        "mariadb-12.3.3-winx64/bin/vcruntime140.dll"
-      ]
-    }
+    "bundle": false,
+    "files": []
   },
   {
     "name": "mysql-old",
@@ -113,6 +95,45 @@
     "url": "https://archive.mariadb.org/mariadb-10.11.19/winx64-packages/mariadb-10.11.19-winx64.zip",
     "sha256": "398ea30e5036010bbebe01d2b1804280424dcc2626e36d8e95155c04d25a0490",
     "checksumNote": "Matches the vendor-published sha256sums.txt on archive.mariadb.org.",
+    "bundle": false,
+    "files": []
+  },
+  {
+    "name": "postgres-16",
+    "flavor": "postgres",
+    "dest": "postgres-16",
+    "version": "16.15-5",
+    "url": "https://get.enterprisedb.com/postgresql/postgresql-16.15-5-windows-x64-binaries.zip",
+    "sha256": "43bb45f173a6f08cf1d29a97a6d8deb119e8e8093a24c00d2d1001a0ccaa8281",
+    "checksumNote": "No vendor-published checksum (EDB publishes none); sha256 is a first-download pin.",
+    "bundle": true,
+    "files": [
+      "pgsql/bin/libcrypto-3-x64.dll",
+      "pgsql/bin/libiconv-2.dll",
+      "pgsql/bin/libintl-9.dll",
+      "pgsql/bin/liblz4.dll",
+      "pgsql/bin/libpq.dll",
+      "pgsql/bin/libssl-3-x64.dll",
+      "pgsql/bin/libwinpthread-1.dll",
+      "pgsql/bin/libzstd.dll",
+      "pgsql/bin/pg_dump.exe",
+      "pgsql/bin/pg_restore.exe",
+      "pgsql/bin/zlib1.dll"
+    ],
+    "runtimeFrom": {
+      "from": "mariadb",
+      "files": [
+        "mariadb-12.3.3-winx64/bin/vcruntime140.dll"
+      ]
+    }
+  },
+  {
+    "name": "postgres-17",
+    "flavor": "postgres",
+    "version": "17.11-5",
+    "url": "https://get.enterprisedb.com/postgresql/postgresql-17.11-5-windows-x64-binaries.zip",
+    "sha256": "80379b2c04d51c30225532e0ae04509899141e9957ed096fe749d7fd9df8f82f",
+    "checksumNote": "No vendor-published checksum (EDB publishes none); sha256 is a first-download pin.",
     "bundle": false,
     "files": []
   }

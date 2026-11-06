@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import mysql from 'mysql2/promise';
 import { cleanEnv } from '../../../src/main/process/redact';
 
-export type ServerName = 'postgres' | 'postgres-old' | 'mysql' | 'mysql-old' | 'mariadb' | 'mariadb-old';
+export type ServerName = 'postgres' | 'postgres-old' | 'postgres-16' | 'postgres-17' | 'mysql' | 'mysql-old' | 'mariadb' | 'mariadb-old';
 export interface TempServer {
   host: '127.0.0.1';
   port: number;
@@ -53,7 +53,7 @@ async function killPostmaster(data: string): Promise<void> {
   await run('taskkill', ['/PID', String(pid), '/T', '/F'], 30_000).catch(() => undefined);
 }
 
-async function startPostgres(name: 'postgres' | 'postgres-old', emptyPassword: boolean): Promise<TempServer> {
+async function startPostgres(name: 'postgres' | 'postgres-old' | 'postgres-16' | 'postgres-17', emptyPassword: boolean): Promise<TempServer> {
   const bin = join(REPO_ROOT, '.cache', 'servers', name, 'bin');
   const dir = await fs.mkdtemp(join(tmpdir(), `dbsync-${name}-`));
   const data = join(dir, 'data');
@@ -197,7 +197,7 @@ async function startMysqlFamily(name: 'mysql' | 'mysql-old' | 'mariadb' | 'maria
 export interface TempServerOptions { emptyPassword?: boolean; noTls?: boolean }
 
 export async function startTempServer(name: ServerName, options: TempServerOptions = {}): Promise<TempServer> {
-  if (name === 'postgres' || name === 'postgres-old') return startPostgres(name, options.emptyPassword ?? false);
+  if (name === 'postgres' || name === 'postgres-old' || name === 'postgres-16' || name === 'postgres-17') return startPostgres(name, options.emptyPassword ?? false);
   if (name === 'mysql' || name === 'mysql-old' || name === 'mariadb' || name === 'mariadb-old') return startMysqlFamily(name, options.emptyPassword ?? false, options.noTls ?? false);
   throw new Error(`Temp ${name} servers are not available yet.`);
 }

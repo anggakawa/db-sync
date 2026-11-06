@@ -266,12 +266,12 @@ PostgreSQL 15 can't load this dump from dev 17. Upgrade your local image."
 - **MariaDB ed25519:** an account that signs in with the `ed25519` plugin is not
   supported, because the Node driver has no such plugin. DB Sync says so and asks
   for an account with a different sign-in method.
-- **PostgreSQL 15 and 16 local servers:** only PostgreSQL 14 and 18 tools are
-  bundled. A 15 or 16 server gets the 18 tools, whose dump a server older than 17
-  rejects (`transaction_timeout`). Servers 15 and 16 were not available to test; by
-  the same cause a sync to such a target is expected to fail at the restore, and
-  the backup, restored with the same tools, to fail too (recovery-failed, backup
-  kept). Adding the 15 and 16 tools is a manifest change of about 7 to 11 MB each.
+- **PostgreSQL local servers older than the dev server's tool set:** a local
+  server at 16 or older cannot receive a copy of a dev server at 17 or newer.
+  The sync is refused by the check `target-too-old` ("Local PostgreSQL 14 can't
+  load this dump from dev 18. Upgrade your local image."). Within one tool set
+  (16 to 14, 18 to 17) an older local server is only a warning, as for the other
+  engines.
 - **MySQL tools and a non-ASCII install path:** the MySQL tools receive
   `--plugin-dir` in the Windows ANSI code page, so with an install folder outside
   that code page the `mysql_native_password` plugin cannot be found and such
@@ -284,7 +284,7 @@ PostgreSQL 15 can't load this dump from dev 17. Upgrade your local image."
 
 | Engine | Tools | Selection |
 |---|---|---|
-| PostgreSQL | `pg_dump`, `pg_restore` and required DLLs, for majors 18 (newest stable at build time) and 14 | The oldest bundled major that is not older than the server the tool talks to |
+| PostgreSQL | `pg_dump`, `pg_restore` and required DLLs, for majors 18 (newest stable at build time) and 16 | The 16 tools for a server at 16 or older, the 18 tools for 17 or newer |
 | MySQL | `mysqldump`, `mysql` and required DLLs | When the server reports MySQL |
 | MariaDB | `mariadb-dump`, `mariadb` and required DLLs | When the server reports MariaDB |
 
@@ -329,16 +329,23 @@ The risks listed during design were checked with real servers
 14.24, MySQL 8.0.46 and MariaDB 10.11.19, the previous lines a dev server is
 likely to run.
 
-- **PostgreSQL 18 tools against PostgreSQL 14:** they do not restore cleanly.
-  `pg_dump` 18 writes `SET transaction_timeout = 0`, which a 14 server rejects
-  under `--exit-on-error`, and `pg_restore` 14 cannot read the 18 archive format.
-  This also broke recovery from the backup, because the backup was made with the
-  same tools. The fallback was needed: PostgreSQL 14 tools are bundled beside the
-  18 tools, and each tool run uses the oldest bundled major that is not older than
-  the server it talks to. The dump of the dev server, the backup of the local
-  database and the restore all follow this rule. Results:
-  14 to 14 and 14 to 18 succeed; 18 to 14 fails at the restore with "can't load
-  this dump from dev 18" and the previous local data is restored from the backup.
+- **PostgreSQL 18 tools against older servers:** they do not restore cleanly to a
+  server older than 17. `pg_dump` 18 writes `SET transaction_timeout = 0` (new in
+  17), which an older server rejects under `--exit-on-error`, and `pg_restore` 14
+  to 16 cannot read the 18 archive format. This also broke recovery from the
+  backup, because the backup was made with the same tools. The fallback was
+  needed: PostgreSQL 16 tools are bundled beside the 18 tools. A server at 16 or
+  older uses the 16 tools, and a server at 17 or newer uses the 18 tools. The dump
+  of the dev server, the backup of the local database and the restore each follow
+  this rule for the server they talk to.
+  Tested with real servers (14.24, 16.15, 17.11 and 18.6) and the bundled tools:
+  14 to 14, 14 to 16, 16 to 16, 14 to 18, 16 to 18, 17 to 17, 17 to 18 and 18 to 18
+  succeed. A newer dev into an older local server with the same tool set
+  (16 to 14, 18 to 17) also succeeded. A dev that needs the 18 tools with a local
+  server that needs the 16 tools (tested: 18 to 14, 18 to 16 and 17 to 14) is
+  blocked by the check `target-too-old` before anything is backed up or dropped,
+  with or without a backup. Other versions (15, 13 and older, 19) were not tested;
+  15 is assumed to behave like 14 and 16.
 - **`--column-statistics=0`:** not needed. MySQL 9.7 `mysqldump` dumps MySQL 9.7 and
   MySQL 8.0 servers without it, and `mariadb-dump` does not use that feature.
 - **MySQL 9.7 tools and `mysql_native_password`:** MySQL 9 no longer includes
@@ -349,6 +356,6 @@ likely to run.
 - **MySQL 9.7 and MariaDB 12.3 against their previous lines:** 8.0 to 8.0, 8.0 to
   9.7, 9.7 to 8.0, 10.11 to 10.11, 10.11 to 12.3 and 12.3 to 10.11 all succeed
   with the bundled tools.
-- **Installer size:** the bundled tools take 50 MB on disk (PostgreSQL 18 11 MB,
-  PostgreSQL 14 7 MB, MySQL 23 MB, MariaDB 10 MB), under the 100 MB estimate. The
-  installer itself is measured when packaging is built.
+- **Installer size:** the bundled tools take 54.0 MB on disk (PostgreSQL 18 10.6 MB,
+  PostgreSQL 16 10.8 MB, MySQL 22.6 MB, MariaDB 10.0 MB), under the 100 MB
+  estimate. The installer itself is measured when packaging is built.

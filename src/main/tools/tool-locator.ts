@@ -29,7 +29,10 @@ const EXECUTABLES: Record<Flavor, Record<ToolName, string>> = {
 };
 
 /** Older PostgreSQL majors bundled beside the newest one, in resources/tools/postgres-<major>. */
-export const OLDER_POSTGRES_MAJORS: readonly number[] = [14];
+export const OLDER_POSTGRES_MAJORS: readonly number[] = [16];
+
+/** True when `serverMajor` is served by an older bundled tool set rather than the newest. */
+export const usesOlderPostgresTools = (serverMajor: number): boolean => OLDER_POSTGRES_MAJORS.some((m) => m >= serverMajor);
 
 function folderFor(flavor: Flavor, serverMajor?: number): string {
   if (flavor !== 'postgres' || serverMajor === undefined) return flavor;

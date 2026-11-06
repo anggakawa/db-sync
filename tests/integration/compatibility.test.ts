@@ -1,5 +1,5 @@
-// Which servers the bundled tools (PostgreSQL 18, MySQL 9.7, MariaDB 12.3) can copy between. The "-old" servers are the
-// previous lines a real dev server is likely to run: PostgreSQL 14, MySQL 8.0, MariaDB 10.11. Every server here is started by
+// Which servers the bundled tools (PostgreSQL 16 and 18, MySQL 9.7, MariaDB 12.3) can copy between. The other servers are the
+// older lines a real dev server is likely to run: PostgreSQL 14, 16 and 17, MySQL 8.0, MariaDB 10.11. Every server here is started by
 // the test on 127.0.0.1; nothing else is ever connected to.
 import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -57,8 +57,23 @@ function expectCleanEnd(outcome: SyncOutcome) {
 
 // ---------------------------------------------------------------- PostgreSQL
 
-describe('PostgreSQL 14 and 18', () => {
-  let pg: TempServer[]; // pg[0], pg[1]: version 18; pg[2], pg[3]: version 14
+// Servers by major, each with a dev server (carrying the fixture) and a local server.
+// Tools: majors up to 16 use the bundled 16 tools, 17 and newer the 18 tools.
+const PG_MAJORS = [
+  { major: 14, name: 'postgres-old' },
+  { major: 16, name: 'postgres-16' },
+  { major: 17, name: 'postgres-17' },
+  { major: 18, name: 'postgres' },
+] as const satisfies ReadonlyArray<{ major: number; name: ServerName }>;
+// [dev major, local major, expectation]: older-to-newer and same-version must succeed; newer-to-older inside one tool set ends cleanly.
+const PG_PAIRS: Array<[number, number, 'succeeds' | 'ends cleanly']> = [
+  [14, 14, 'succeeds'], [14, 16, 'succeeds'], [16, 16, 'succeeds'], [16, 14, 'ends cleanly'], [14, 18, 'succeeds'],
+  [16, 18, 'succeeds'], [17, 17, 'succeeds'], [17, 18, 'succeeds'], [18, 17, 'ends cleanly'], [18, 18, 'succeeds'],
+];
+
+describe('PostgreSQL 14, 16, 17 and 18', () => {
+  const dev = new Map<number, TempServer>();
+  const local = new Map<number, TempServer>();
   let adapter: EngineAdapter;
   const clients: Client[] = [];
 
@@ -84,55 +99,67 @@ describe('PostgreSQL 14 and 18', () => {
       tables: await rows(`SELECT schemaname || '.' || tablename AS t FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') ORDER BY 1`),
     };
   });
+  const leftOver = (server: TempServer, db: string) => withClient(server, db, async (c) => ({
+    precious: (await c.query('SELECT * FROM precious')).rows,
+    copied: (await c.query(`SELECT to_regclass('public.customers') AS t`)).rows[0].t,
+  }));
+  const PRECIOUS = `CREATE TABLE precious (id int, v text); INSERT INTO precious VALUES (1, 'mine');`;
 
   beforeAll(async () => {
-    pg = await startTempServers(['postgres'], ['postgres'], ['postgres-old'], ['postgres-old']);
+    const started = await startTempServers(...PG_MAJORS.flatMap((p) => [[p.name], [p.name]] as Array<[ServerName]>));
+    PG_MAJORS.forEach((p, i) => { dev.set(p.major, started[i * 2]); local.set(p.major, started[i * 2 + 1]); });
     adapter = createPostgresAdapter({ locate: createToolLocator(BUNDLED_TOOLS), tmpRoot: join(rootDir, 'tmp') });
     const sql = await fs.readFile(join(FIXTURES, 'postgres.sql'), 'utf8');
-    await createDb(pg[0], 'dev_app', sql);
-    await createDb(pg[2], 'dev_app', sql);
+    for (const server of dev.values()) await createDb(server, 'dev_app', sql);
   });
   afterAll(async () => {
     await Promise.all(clients.map((c) => c.end().catch(() => undefined)));
-    await Promise.all((pg ?? []).map((s) => s.stop()));
+    await Promise.all([...dev.values(), ...local.values()].map((s) => s.stop()));
   });
 
-  const sync = (src: TempServer, tgt: TempServer, tgtDb: string) =>
-    runSyncForTest(adapter, profile('postgres', endpoint(src, 'dev_app'), endpoint(tgt, tgtDb)), rootDir);
+  const profileOf = (from: number, to: number, tgtDb: string, backupEnabled = true): Profile =>
+    ({ ...profile('postgres', endpoint(dev.get(from)!, 'dev_app'), endpoint(local.get(to)!, tgtDb)), backupEnabled });
 
-  it('postgres-old source to postgres-old target succeeds using bundled tools', async () => {
-    await createDb(pg[3], 'old_old');
-    const { outcome } = await sync(pg[2], pg[3], 'old_old');
-    expect(outcome, why(outcome)).toMatchObject({ status: 'success', targetState: 'replaced', warnings: [] });
-    expect(await snapshot(pg[3], 'old_old')).toEqual(await snapshot(pg[2], 'dev_app'));
-    await withClient(pg[3], 'old_old', async (c) => {
-      await c.query('INSERT INTO orders (customer_id, total) VALUES (1, 1)');
-      expect((await c.query('SELECT count(*)::int AS n FROM audit')).rows[0].n).toBe(4); // trigger fires
-      expect((await c.query('SELECT add_one(41) AS v')).rows[0].v).toBe(42);
-    });
-  });
-
-  it('postgres-old source to postgres target succeeds', async () => {
-    await createDb(pg[1], 'old_new');
-    const { outcome } = await sync(pg[2], pg[1], 'old_new');
-    expect(outcome, why(outcome)).toMatchObject({ status: 'success', targetState: 'replaced' });
-    expect(await snapshot(pg[1], 'old_new')).toEqual(await snapshot(pg[2], 'dev_app'));
-  });
-
-  it('postgres source to postgres-old target ends cleanly', async () => {
-    await createDb(pg[3], 'new_old', `CREATE TABLE precious (id int, v text); INSERT INTO precious VALUES (1, 'mine');`);
-    const { outcome } = await sync(pg[0], pg[3], 'new_old');
-    const result = expectCleanEnd(outcome);
-    if (result === 'success') {
-      expect(await snapshot(pg[3], 'new_old')).toEqual(await snapshot(pg[0], 'dev_app'));
+  it.each(PG_PAIRS)('postgres %i source to postgres %i target %s', async (from, to, expectation) => {
+    const db = `t_${from}_${to}`;
+    const target = local.get(to)!;
+    await createDb(target, db, PRECIOUS);
+    const { outcome } = await runSyncForTest(adapter, profileOf(from, to, db), rootDir);
+    let result: 'success' | 'restored';
+    if (expectation === 'succeeds') {
+      expect(outcome, why(outcome)).toMatchObject({ status: 'success', targetState: 'replaced' });
+      result = 'success';
     } else {
-      const left = await withClient(pg[3], 'new_old', async (c) => ({
-        precious: (await c.query('SELECT * FROM precious')).rows,
-        copied: (await c.query(`SELECT to_regclass('public.customers') AS t`)).rows[0].t,
-      }));
-      expect(left).toEqual({ precious: [{ id: 1, v: 'mine' }], copied: null });
+      result = expectCleanEnd(outcome);
     }
-    console.log(`[compat] postgres 18 -> postgres 14: ${result}${outcome.status === 'failed' ? `: ${outcome.message} | ${outcome.details}` : ''}`);
+    if (result === 'success') {
+      expect(await snapshot(target, db)).toEqual(await snapshot(dev.get(from)!, 'dev_app'));
+      await withClient(target, db, async (c) => {
+        await c.query('INSERT INTO orders (customer_id, total) VALUES (1, 1)');
+        expect((await c.query('SELECT count(*)::int AS n FROM audit')).rows[0].n).toBe(4); // trigger fires
+        expect((await c.query('SELECT add_one(41) AS v')).rows[0].v).toBe(42);
+      });
+    } else {
+      expect(await leftOver(target, db)).toEqual({ precious: [{ id: 1, v: 'mine' }], copied: null });
+    }
+    console.log(`[compat] postgres ${from} -> postgres ${to}: ${result}${outcome.status === 'failed' ? `: ${outcome.message} | ${outcome.details}` : ''}`);
+  });
+
+  // The newest pg_dump's archive can't be read by the 16 tools, so these would only fail after the drop: the check refuses them first.
+  it.each([[18, 14], [18, 16], [17, 14]])('postgres %i source to postgres %i target is blocked before anything changes', async (from, to) => {
+    for (const backupEnabled of [true, false]) {
+      const db = `blk_${from}_${to}_${backupEnabled ? 'b' : 'n'}`;
+      const target = local.get(to)!;
+      await createDb(target, db, PRECIOUS);
+      const { outcome } = await runSyncForTest(adapter, profileOf(from, to, db, backupEnabled), rootDir);
+      expect(outcome, why(outcome)).toMatchObject({
+        status: 'failed', step: 'check', targetState: 'untouched',
+        message: `Local PostgreSQL ${to} can't load this dump from dev ${from}. Upgrade your local image.`,
+        details: 'target-too-old',
+      });
+      // Nothing was dropped or restored: the same database, with its own table and no copied one.
+      expect(await leftOver(target, db)).toEqual({ precious: [{ id: 1, v: 'mine' }], copied: null });
+    }
   });
 });
 
