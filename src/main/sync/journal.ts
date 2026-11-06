@@ -19,11 +19,22 @@ export async function writeJournal(paths: SyncPaths, j: Journal): Promise<void> 
   }
 }
 
+/** The record exists but cannot be read. Treating it as absent could overwrite a good backup. */
+export class JournalDamagedError extends Error {
+  constructor(readonly path: string) {
+    super(`The recovery record at ${path} is damaged.`);
+    this.name = 'JournalDamagedError';
+  }
+}
+
 export async function readJournal(paths: SyncPaths, id: string): Promise<Journal | null> {
   try {
-    return JSON.parse(await fs.readFile(paths.journal(id), 'utf8')) as Journal;
+    const parsed: unknown = JSON.parse(await fs.readFile(paths.journal(id), 'utf8'));
+    if (typeof parsed !== 'object' || parsed === null) throw new JournalDamagedError(paths.journal(id));
+    return parsed as Journal;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    if (err instanceof SyntaxError) throw new JournalDamagedError(paths.journal(id));
     throw err;
   }
 }

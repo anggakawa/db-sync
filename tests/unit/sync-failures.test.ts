@@ -148,12 +148,12 @@ describe('step 4 recovery', () => {
     expect(await readJournal(paths, profile.id)).toBeNull();
   });
 
-  it('reports maybe-incomplete when the backup was turned off', async () => {
+  it('reports maybe-incomplete when the backup was turned off, and keeps the journal', async () => {
     const { fake, runner, callbacks } = setup({ failuresOnce: { 'target.restore': new Error('boom') } });
     const out = await runner.sync({ ...profile, backupEnabled: false }, callbacks());
     expect(out).toMatchObject({ status: 'failed', targetState: 'maybe-incomplete' });
     expect(fake.calls).toEqual(['source.dump', 'target.dropDatabase', 'target.createDatabase', 'target.restore']);
-    expect(await readJournal(paths, profile.id)).toBeNull();
+    expect(await readJournal(paths, profile.id)).not.toBeNull();
   });
 
   it('never auto-restores a stale backup from an earlier sync', async () => {
@@ -234,14 +234,14 @@ describe('recover() and restoreBackup()', () => {
     expect(aborted).toEqual([false]);
   });
 
-  it('recover() with backup off reports maybe-incomplete and clears the journal', async () => {
+  it('recover() with backup off reports maybe-incomplete and keeps the journal', async () => {
     await writeJournal(paths, { profileId: 'p1', hadTarget: true, backupAvailable: false, startedAt: 'x', target: tgt });
     const { fake, runner, callbacks } = setup();
     const out = await runner.recover(profile, callbacks());
     expect(out).toMatchObject({ status: 'failed', targetState: 'maybe-incomplete' });
     expect(fake.calls).toEqual([]);
     expect(fake.opens).toEqual([]);
-    expect(await readJournal(paths, profile.id)).toBeNull();
+    expect(await readJournal(paths, profile.id)).not.toBeNull();
   });
 
   it('recover() removes the partial database when the target did not exist', async () => {
@@ -464,11 +464,13 @@ describe('fix round 1: a pending journal is honoured', () => {
   });
 
   it('skips the backup and keeps the earlier flags when the earlier run had no backup', async () => {
+    await writeBackup('good backup');
     await pending({ backupAvailable: false, hadTarget: false });
     const { fake, runner, callbacks } = setup({ failuresOnce: { 'target.restore': new Error('boom') } });
     const out = await runner.sync(profile, callbacks());
     expect(fake.calls).not.toContain('target.dump');
     expect(out).toMatchObject({ status: 'failed', targetState: 'removed-partial' });
+    expect(await readFile(paths.backupLatest(profile.id), 'utf8')).toBe('good backup');
   });
 });
 
@@ -647,5 +649,112 @@ describe('fix round 1: removals retry', () => {
     const { runner, callbacks } = setup();
     await runner.sync(profile, callbacks());
     expect(seen[0]).toMatchObject({ force: true, maxRetries: 3, retryDelay: 100 });
+  });
+});
+
+describe('fix round 2: the journal clears only when the target is known good', () => {
+  const pending = (over: object = {}) =>
+    writeJournal(paths, { profileId: 'p1', hadTarget: true, backupAvailable: true, startedAt: 'old', target: tgt, ...over });
+  const latest = () => readFile(paths.backupLatest(profile.id), 'utf8');
+  const journalText = () => readFile(paths.journal(profile.id), 'utf8');
+
+  it.each([
+    { hadTarget: true, backupAvailable: true },
+    { hadTarget: true, backupAvailable: false },
+    { hadTarget: false, backupAvailable: false },
+  ])('a blocked drop on a re-sync keeps the journal and latest ($hadTarget, $backupAvailable)', async (flags) => {
+    await writeBackup('good backup');
+    await pending(flags);
+    const a = setup({ failures: { 'target.dropDatabase': new DropBlockedError(['psql', 'dbeaver']) } });
+    const out = await a.runner.sync(profile, a.callbacks());
+    expect(out).toMatchObject({ status: 'failed', targetState: 'maybe-incomplete' });
+    expect(out.status === 'failed' && out.message).toMatch(/may be incomplete/);
+    expect(out.status === 'failed' && out.message).toContain('dbeaver');
+    expect(await readJournal(paths, profile.id)).toMatchObject(flags);
+    expect(await latest()).toBe('good backup');
+
+    const b = setup();
+    expect(await b.runner.sync(profile, b.callbacks())).toMatchObject({ status: 'success' });
+    expect(b.fake.calls).not.toContain('target.dump');
+    expect(await latest()).toBe('good backup');
+    expect(await readJournal(paths, profile.id)).toBeNull();
+  });
+
+  it('a blocked drop with no earlier journal still ends untouched with no journal', async () => {
+    const { runner, callbacks } = setup({ failures: { 'target.dropDatabase': new DropBlockedError(['psql']) } });
+    expect(await runner.sync(profile, callbacks())).toMatchObject({ targetState: 'untouched' });
+    expect(await readJournal(paths, profile.id)).toBeNull();
+  });
+
+  it('restoreBackup over an earlier journal plus a blocked drop restores the journal', async () => {
+    await writeBackup('good backup');
+    await pending({ backupAvailable: false });
+    const before = await journalText();
+    const { runner, callbacks } = setup({ failures: { 'target.dropDatabase': new DropBlockedError(['psql']) } });
+    const out = await runner.restoreBackup(profile, callbacks());
+    expect(out).toMatchObject({ status: 'failed', targetState: 'maybe-incomplete' });
+    expect(await journalText()).toBe(before);
+    expect(await latest()).toBe('good backup');
+  });
+
+  it('restoreBackup with no earlier journal plus a blocked drop leaves none and is untouched', async () => {
+    await writeBackup('good backup');
+    const { runner, callbacks } = setup({ failures: { 'target.dropDatabase': new DropBlockedError(['psql']) } });
+    expect(await runner.restoreBackup(profile, callbacks())).toMatchObject({ targetState: 'untouched' });
+    expect(await readJournal(paths, profile.id)).toBeNull();
+  });
+
+  it('a failed re-sync with backupAvailable false keeps the journal, and a later sync leaves latest alone', async () => {
+    await writeBackup('good backup');
+    await pending({ backupAvailable: false });
+    const a = setup({ failuresOnce: { 'target.restore': new Error('boom') } });
+    expect(await a.runner.sync(profile, a.callbacks())).toMatchObject({ status: 'failed', targetState: 'maybe-incomplete' });
+    expect(await readJournal(paths, profile.id)).toMatchObject({ hadTarget: true, backupAvailable: false });
+    const b = setup();
+    expect(await b.runner.sync(profile, b.callbacks())).toMatchObject({ status: 'success' });
+    expect(b.fake.calls).not.toContain('target.dump');
+    expect(await latest()).toBe('good backup');
+  });
+
+  it('a re-sync cancelled during download leaves the journal and latest unchanged', async () => {
+    await writeBackup('good backup');
+    await pending();
+    const before = await journalText();
+    const ac = new AbortController();
+    const { fake, runner, callbacks } = setup();
+    fake.config.hooks['source.dump'] = () => { ac.abort(); };
+    expect(await runner.sync(profile, callbacks(ac.signal))).toMatchObject({ status: 'cancelled', targetState: 'untouched' });
+    expect(await journalText()).toBe(before);
+    expect(await latest()).toBe('good backup');
+  });
+
+  it('a successful re-sync with backupAvailable false clears the journal and leaves latest', async () => {
+    await writeBackup('good backup');
+    await pending({ backupAvailable: false });
+    const { runner, callbacks } = setup();
+    expect(await runner.sync(profile, callbacks())).toMatchObject({ status: 'success' });
+    expect(await readJournal(paths, profile.id)).toBeNull();
+    expect(await latest()).toBe('good backup');
+  });
+});
+
+describe('fix round 2: a damaged journal stops everything', () => {
+  const expected = () =>
+    `The recovery record at ${paths.journal(profile.id)} is damaged, so this was stopped to protect your backup in ${paths.backupDir(profile.id)}. Delete the record to continue.`;
+  const damage = async () => {
+    await writeBackup('good backup');
+    await mkdir(join(root, 'journal'), { recursive: true });
+    await writeFile(paths.journal(profile.id), '{"profileId": "p1", "hadTa');
+  };
+
+  it.each(['sync', 'recover', 'restoreBackup'] as const)('%s refuses with no connection', async (entry) => {
+    await damage();
+    const { fake, runner, callbacks } = setup();
+    const out = await runner[entry](profile, callbacks());
+    expect(out).toMatchObject({ status: 'failed', targetState: 'maybe-incomplete', message: expected() });
+    expect(fake.opens).toEqual([]);
+    expect(fake.calls).toEqual([]);
+    expect(await readFile(paths.backupLatest(profile.id), 'utf8')).toBe('good backup');
+    expect(await exists(paths.journal(profile.id))).toBe(true);
   });
 });
