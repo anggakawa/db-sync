@@ -49,9 +49,10 @@ describe('tool arguments', () => {
       }
     }
   });
-  it('puts host, port and user on the command line so a login path cannot override them', () => {
+  it('puts host and port on the command line, and the user only in the defaults file', () => {
     for (const args of [dumpArgs(ep, FILE, mysql), restoreArgs(ep, FILE, mariadb)]) {
-      expect(args).toEqual(expect.arrayContaining(['--host=db.example.com', '--port=3307', '--user=me']));
+      expect(args).toEqual(expect.arrayContaining(['--host=db.example.com', '--port=3307']));
+      expect(args.some((a) => a.startsWith('--user'))).toBe(false); // mysqldump takes non-ASCII argv as raw bytes
     }
   });
   it('points MYSQL_TEST_LOGIN_FILE at a file that does not exist', () => {
@@ -78,7 +79,10 @@ describe('tool arguments', () => {
     expect(dumpArgs(ep, FILE, mariadb)).not.toContain('--set-gtid-purged=OFF');
   });
   it('builds the ssl flags per flavor', () => {
-    expect(dumpArgs(ep, FILE, { ...mysql, ssl: true })).toContain('--ssl-mode=REQUIRED');
+    expect(dumpArgs(ep, FILE, { ...mysql, ssl: false })).toContain('--ssl-mode=DISABLED');
+    expect(dumpArgs(ep, FILE, { ...mysql, ssl: false })).toContain('--get-server-public-key'); // no TLS: do not rely on the server's auth cache
+    expect(dumpArgs(ep, FILE, { ...mysql, ssl: true })).not.toContain('--get-server-public-key');
+    expect(dumpArgs(ep, FILE, { ...mariadb, ssl: false })).not.toContain('--get-server-public-key');
     expect(dumpArgs(ep, FILE, { ...mysql, ssl: false })).toContain('--ssl-mode=DISABLED');
     expect(dumpArgs(ep, FILE, { ...mariadb, ssl: true })).toEqual(expect.arrayContaining(['--ssl', '--skip-ssl-verify-server-cert']));
     expect(dumpArgs(ep, FILE, { ...mariadb, ssl: false })).toContain('--skip-ssl');

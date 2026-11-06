@@ -36,6 +36,43 @@ describe('definer filter: object headers', () => {
     expect(await filterText(`${context}${input}\n`, 1)).toBe(`${context}${expected}\n`);
   });
 
+  // MySQL 9.7 after the database collation changed: an ALTER DATABASE line comes first inside the block.
+  it.each([
+    [
+      'MySQL, collation changed',
+      `${D}ALTER DATABASE \`app\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci ;;\n/*!50003 SET @saved_cs_client = @@character_set_client */ ;;\n/*!50003 SET time_zone = 'SYSTEM' */ ;;\n`,
+    ],
+    ['a longer delimiter', "DELIMITER ;;;\n/*!50003 SET time_zone = 'SYSTEM' */ ;;;\n"],
+  ])('finds the event header after %s', async (_name, context) => {
+    const header = '/*!50106 CREATE*/ /*!50117 DEFINER=`dev_owner`@`%`*/ /*!50106 EVENT e';
+    const want = `${context.replace(' `app`', '')}/*!50106 CREATE*/ /*!50106 EVENT e\n`;
+    expect(await filterText(`${context}${header}\n`)).toBe(want);
+    expect(await filterText(`${context}${header}\n`, 1)).toBe(want);
+  });
+
+  // mysqldump names the source database in these lines; restored into a database with another name they would fail.
+  it.each([
+    ['ALTER DATABASE `dev_app` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ;', 'ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ;'],
+    ['ALTER DATABASE `we``ird` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci ;;', 'ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci ;;'],
+  ])('drops the source database name from %s', async (line, expected) => {
+    for (const eol of ['\n', '\r\n']) {
+      expect(await filterText(`${D}${line}${eol}-- x${eol}`)).toBe(`${D}${expected}${eol}-- x${eol}`);
+      expect(await filterText(`${line}${eol}`, 1)).toBe(`${expected}${eol}`);
+    }
+  });
+
+  it('leaves an ALTER DATABASE line that is not the dump\'s own shape, and one inside a row, unchanged', async () => {
+    const text = "  ALTER DATABASE `app` CHARACTER SET utf8mb4 COLLATE x ;\nALTER DATABASE `app` SET something ;\nINSERT INTO t VALUES ('x');\n";
+    expect(await filterText(text)).toBe(text);
+    const row = "INSERT INTO t VALUES\n(1,'ALTER DATABASE `app` CHARACTER SET utf8mb4 COLLATE x ;');\n";
+    expect(await filterText(row)).toBe(row);
+  });
+
+  it('does not treat an ALTER DATABASE line outside a DELIMITER block as part of one', async () => {
+    const text = 'ALTER DATABASE `app` CHARACTER SET utf8mb4 COLLATE x ;\n/*!50106 CREATE*/ /*!50117 DEFINER=`a`@`b`*/ /*!50106 EVENT e\n';
+    expect(await filterText(text)).toBe(text.replace(' `app`', '')); // the name goes; the event line is not a header here
+  });
+
   it.each([
     ['a column default', "  `c` varchar(100) DEFAULT 'CREATE DEFINER=`a`@`b` x',"],
     ['a table comment', ") ENGINE=InnoDB COMMENT='/*!1 DEFINER=`a`@`b`*/ note';"],

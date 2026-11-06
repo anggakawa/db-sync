@@ -364,7 +364,10 @@ describe('limits and refusals', () => {
 
     const t = await adapter.openTarget(endpoint(limitedServer, 'guarded_t'));
     try {
-      await expect(t.dropDatabase(ctx())).rejects.toBeInstanceOf(DropBlockedError);
+      const err = await t.dropDatabase(ctx()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(DropBlockedError);
+      expect(err).toMatchObject({ reason: 'permission' });
+      expect((err as DropBlockedError).cause).toMatch(/permission denied|must be owner/i);
     } finally {
       await t.close();
     }
@@ -373,6 +376,8 @@ describe('limits and refusals', () => {
     profile.target = endpoint(limitedServer, 'guarded_t');
     const { outcome } = await runSyncForTest(adapter, profile, rootDir);
     expect(outcome).toMatchObject({ status: 'failed', step: 'replace', targetState: 'untouched' });
+    expect(outcome.status === 'failed' && outcome.message).toContain("This account isn't allowed to drop the local database: ");
+    expect(outcome.status === 'failed' && outcome.message).toContain('Nothing was deleted. Use an account that can.');
     await withClient(local, 'guarded_t', async (c) => {
       expect((await c.query('SELECT id FROM keep ORDER BY id')).rows).toEqual([{ id: 1 }, { id: 2 }]);
     });

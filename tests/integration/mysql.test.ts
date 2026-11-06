@@ -120,9 +120,10 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
     const left = (await fs.readdir(tmpRoot).catch(() => [] as string[])).filter((f) => /\.cnf$/.test(f));
     expect(left).toEqual([]);
     for (const run of toolRuns) {
+      // The tool is given a bare file name and runs in tmpRoot.
       const first = run.args[0] ?? '';
-      if (run.command.includes(flavor === 'mysql' ? 'mysql' : 'mariadb') && first.startsWith('--defaults-extra-file=')) {
-        expect(await exists(first.slice('--defaults-extra-file='.length))).toBe(false);
+      if (first.startsWith('--defaults-file=')) {
+        expect(await exists(join(tmpRoot, first.slice('--defaults-file='.length)))).toBe(false);
       }
     }
   }
@@ -146,6 +147,10 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
       await c.query('CREATE DATABASE dev_app');
       await c.query('USE dev_app');
       for (const sql of statementsOf(await fs.readFile(FIXTURE, 'utf8'))) await c.query(sql);
+      // An event whose body contains ;; makes mysqldump 9.7 spin forever (a bug in that tool), so only MariaDB gets one.
+      if (flavor === 'mariadb') {
+        await c.query("CREATE DEFINER=`dev_owner`@`%` EVENT semicolons_in_body ON SCHEDULE EVERY 1 DAY STARTS '2035-01-01 00:00:00' DO SET @x = ';;'");
+      }
     });
   });
 
@@ -185,7 +190,8 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
         await c.query('CALL add_order(2, 5.00)'); // the procedure is callable
         expect((await rows(c, 'SELECT COUNT(*) AS n FROM orders'))[0].n).toBe(5);
         expect((await rows(c, 'SELECT add_one(41) AS v'))[0].v).toBe(42); // the function is callable
-        expect((await rows(c, `SELECT event_name AS n FROM information_schema.events WHERE event_schema = 'copy_t'`)).map((r) => r.n)).toEqual(['cleanup_audit']);
+        expect((await rows(c, `SELECT event_name AS n FROM information_schema.events WHERE event_schema = 'copy_t'`)).map((r) => r.n).sort())
+          .toEqual(flavor === 'mariadb' ? ['before_collation_change', 'cleanup_audit', 'semicolons_in_body'] : ['before_collation_change', 'cleanup_audit']);
         expect((await rows(c, 'SELECT total FROM order_totals WHERE name = "Bob"'))[0].total).toBe('104.99'); // the view works
         await c.query(`INSERT INTO customers (name) VALUES ('Cy')`);
         expect((await rows(c, `SELECT id FROM customers WHERE name = 'Cy'`))[0].id).toBe(100); // auto-increment continues
@@ -205,7 +211,7 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
         ...(await rows(c, `SELECT definer AS d FROM information_schema.events WHERE event_schema = 'definer_t'`)),
         ...(await rows(c, `SELECT definer AS d FROM information_schema.views WHERE table_schema = 'definer_t'`)),
       ].map((r) => String(r.d)));
-      expect(owners.length).toBe(6); // three routines, a trigger, an event and a view
+      expect(owners.length).toBe(flavor === 'mariadb' ? 8 : 7); // three routines, a trigger, the events and a view
       expect(owners.filter((d) => d.includes('dev_owner'))).toEqual([]);
       expect(new Set(owners)).toEqual(new Set([`${local.user}@%`]));
       // The source still has its own definers.
@@ -744,7 +750,8 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
       for (const run of runs) {
         expect(run.args[0]).toMatch(/^--defaults-file=client-[0-9a-f]+\.cnf$/);
         expect(run.args.some((a) => a.startsWith('--defaults-extra-file'))).toBe(false);
-        expect(run.args).toEqual(expect.arrayContaining([expect.stringMatching(/^--host=127\.0\.0\.1$/), expect.stringMatching(/^--port=\d+$/), expect.stringMatching(/^--user=/)]));
+        expect(run.args).toEqual(expect.arrayContaining([expect.stringMatching(/^--host=127\.0\.0\.1$/), expect.stringMatching(/^--port=\d+$/)]));
+        expect(run.args.some((a) => a.startsWith('--user'))).toBe(false); // the user is in the defaults file
         expect(run.env.MYSQL_TEST_LOGIN_FILE).toBeTruthy();
         expect(await exists(run.env.MYSQL_TEST_LOGIN_FILE)).toBe(false);
       }
@@ -814,21 +821,28 @@ port=${local.port}
     it('syncs to a local server that has TLS switched off, because target tools are told not to use it', async () => {
       const plain = await startTempServer(flavor, { noTls: true });
       try {
-        // Without TLS on the server a client that insists on it fails, so the sync below proves the tools did not insist.
-        // (The MariaDB client only asks for TLS and carries on without it, so this check is MySQL's.)
-        if (flavor === 'mysql') {
+        // Prove TLS is off with a client that insists on it. The probe uses a bare file name and cwd, as the adapter does, so
+        // it cannot fail for the path reasons that make mysql.exe reject a defaults file under "dá ta sync".
+        const insisting = flavor === 'mysql' ? ['--ssl-mode=REQUIRED'] : ['--ssl'];
+        const askTls = async (server: TempServer): Promise<string> => {
           await fs.mkdir(tmpRoot, { recursive: true });
-          const probe = join(tmpRoot, 'tls-probe.cnf');
-          await fs.writeFile(probe, defaultsFileContent(plain));
+          await fs.writeFile(join(tmpRoot, 'tls-probe.cnf'), defaultsFileContent(server));
+          const lines: string[] = [];
           try {
-            await expect(runTool({
-              command: locate.path(flavor, 'restore'), args: [`--defaults-file=${probe}`, '--protocol=tcp', '--ssl-mode=REQUIRED', '-e', 'SELECT 1'],
-              signal: new AbortController().signal, secrets: [],
-            })).rejects.toBeInstanceOf(ToolError);
+            await runTool({
+              command: locate.path(flavor, 'restore'), cwd: tmpRoot, env: { MYSQL_TEST_LOGIN_FILE: join(tmpRoot, 'none') },
+              args: ['--defaults-file=tls-probe.cnf', `--host=${server.host}`, `--port=${server.port}`, '--protocol=tcp', ...insisting, '-N', '-e', 'SELECT 1'],
+              signal: new AbortController().signal, secrets: [], onLine: (l) => lines.push(l),
+            });
+            return `connected: ${lines.join(' ')}`;
+          } catch (err) {
+            return `${String(err)} ${lines.join(' ')}`;
           } finally {
-            await fs.rm(probe, { force: true });
+            await fs.rm(join(tmpRoot, 'tls-probe.cnf'), { force: true });
           }
-        }
+        };
+        expect(await askTls(local)).toBe('connected: 1'); // control: the ordinary temp server has TLS
+        expect(await askTls(plain)).toMatch(/SSL is required,? but the server (doesn't|does not) support it/);
 
         await createDb(plain, 'tls_t', ['CREATE TABLE precious (id INT)', 'INSERT INTO precious VALUES (1)']);
         toolRuns.length = 0;
@@ -959,6 +973,22 @@ port=${local.port}
         expect(second.outcome, JSON.stringify(second.outcome)).toMatchObject({ status: 'success' });
         expect((await snapshot(local, 'ja_t')).customers.length).toBe(2);
       });
+    });
+  });
+
+  describe('a user name with a non-ASCII character', () => {
+    it('signs in for the tools, because the user is in the defaults file and not on the command line', async () => {
+      await createUser(source, 'josé', 'jose-pw');
+      await createUser(local, 'josé', 'jose-pw');
+      await createDb(local, 'user_t', ['CREATE TABLE old (id INT)']);
+      const profile = profileFor('dev_app', 'user_t', {
+        src: { ...endpoint(source, 'dev_app', 'jose-pw'), user: 'josé' }, tgt: { ...endpoint(local, 'user_t', 'jose-pw'), user: 'josé' },
+      });
+      toolRuns.length = 0;
+      const { outcome } = await runSyncForTest(adapter, profile, rootDir);
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ status: 'success' });
+      expect(toolRuns.some((r) => r.args.some((a) => a.includes('josé')))).toBe(false);
+      expect(await select(local, 'user_t', 'SELECT COUNT(*) AS n FROM customers', 'jose-pw', 'josé')).toEqual([{ n: 2 }]);
     });
   });
 

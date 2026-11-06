@@ -64,3 +64,8 @@ BEGIN
 END
 -- split
 INSERT INTO notes (id, body) VALUES (1, CONCAT('a;', CHAR(10), 'b CREATE DEFINER=`root`@`%` y;', CHAR(10), ');', CHAR(10), '/*!50013 DEFINER=`a`@`b` SQL SECURITY DEFINER */'))
+-- split
+CREATE DEFINER=`dev_owner`@`%` EVENT before_collation_change ON SCHEDULE EVERY 1 DAY STARTS '2035-01-01 00:00:00'
+  DO DELETE FROM audit WHERE id < 0
+-- split
+ALTER DATABASE dev_app COLLATE utf8mb4_unicode_ci

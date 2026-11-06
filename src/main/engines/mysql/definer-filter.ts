@@ -7,7 +7,16 @@ const ROUTINE = new RegExp(String.raw`^CREATE DEFINER=${USER} `);
 const TRIGGER_OR_EVENT = new RegExp(String.raw`^(/\*!\d+ CREATE\*/ )/\*!\d+ DEFINER=${USER}\s*\*/ ?`);
 const VIEW = new RegExp(String.raw`^(/\*!\d+) DEFINER=${USER} (SQL SECURITY)`);
 /** MySQL writes session settings like this between DELIMITER ;; and an event. */
-const SESSION_SETTING = /^\/\*!50003 SET .*\*\/ ;;\r?$/;
+const SESSION_SETTING = /^\/\*!50003 SET .*\*\/ ;;+\r?$/;
+/** After a database collation change mysqldump writes this line before the object, inside the same DELIMITER block. */
+const ALTER_DATABASE = /^ALTER DATABASE .* ;;+\r?$/;
+/**
+ * The dump's own database collation line names the source database. Restored into a database with another name it would
+ * fail, and ALTER DATABASE without a name acts on the database the client is connected to.
+ */
+const ALTER_DATABASE_NAMED = new RegExp(String.raw`^ALTER DATABASE ${'`(?:[^`]|``)*`'} (CHARACTER SET \w+ COLLATE \w+ ;+\r?)$`);
+/** mysqldump picks a longer delimiter (;;;) when the object body contains ;; */
+const DELIMITER_LINE = /^DELIMITER ;;+$/;
 
 const INSERT_PREFIX = Buffer.from('INSERT INTO');
 const DEFINER_TEXT = Buffer.from('DEFINER=');
@@ -26,15 +35,15 @@ type Header = 'none' | 'afterDelimiter' | 'afterViewStart';
 function processLine(line: Buffer, header: Header): { out: Buffer; next: Header } {
   const text = line.toString('latin1');
   let next: Header = 'none';
-  let edited = text;
+  let edited = text.replace(ALTER_DATABASE_NAMED, 'ALTER DATABASE $1');
   if (header === 'afterDelimiter') {
-    if (SESSION_SETTING.test(text)) next = 'afterDelimiter';
-    else if (line.includes(DEFINER_TEXT)) edited = text.replace(ROUTINE, 'CREATE ').replace(TRIGGER_OR_EVENT, '$1');
+    if (SESSION_SETTING.test(text) || ALTER_DATABASE.test(text)) next = 'afterDelimiter';
+    else if (line.includes(DEFINER_TEXT)) edited = edited.replace(ROUTINE, 'CREATE ').replace(TRIGGER_OR_EVENT, '$1');
   } else if (header === 'afterViewStart' && line.includes(DEFINER_TEXT)) {
     edited = text.replace(VIEW, '$1 $2');
   }
   if (next === 'none') {
-    if (text.replace(/\r$/, '') === 'DELIMITER ;;') next = 'afterDelimiter';
+    if (DELIMITER_LINE.test(text.replace(/\r$/, ''))) next = 'afterDelimiter';
     else if (text.startsWith('/*!50001 CREATE ALGORITHM')) next = 'afterViewStart';
   }
   return { out: edited === text ? line : Buffer.from(edited, 'latin1'), next };

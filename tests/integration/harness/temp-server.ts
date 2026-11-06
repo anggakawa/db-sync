@@ -144,13 +144,17 @@ async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolea
     ];
     if (name === 'mysql') {
       await run(mysqld, ['--no-defaults', '--initialize-insecure', `--datadir=${data}`, `--log-error=${join(dir, 'init.log')}`], 180_000);
+      // Without its certificates (and without generating new ones) the server has no TLS.
+      if (noTls) {
+        for (const file of await fs.readdir(data)) if (file.endsWith('.pem')) await fs.rm(join(data, file), { force: true });
+      }
     } else {
       await run(join(bin, 'mariadb-install-db.exe'), [`--datadir=${data}`, `--port=${port}`, `--password=${rootPassword}`, '--silent'], 180_000);
     }
     const fast = ['--innodb-buffer-pool-size=64M', '--innodb-flush-log-at-trx-commit=0', '--max-connections=60'];
     const extra = name === 'mysql' ? ['--mysqlx=OFF', '--disable-log-bin'] : ['--skip-log-bin'];
     // MariaDB has no certificate configured here, so it already runs without TLS.
-    if (noTls && name === 'mysql') extra.push('--auto-generate-certs=OFF');
+    if (noTls) extra.push(name === 'mysql' ? '--auto-generate-certs=OFF' : '--skip-ssl');
     // --no-defaults first: the machine's my.ini must not change how a test server runs.
     daemon = spawnDaemon(mysqld, ['--no-defaults', ...common, ...fast, ...extra]);
 

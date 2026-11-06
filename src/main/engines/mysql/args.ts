@@ -47,7 +47,7 @@ export function defaultsFileContent(e: { host: string; port: number; user: strin
 
 function sslArgs(o: ToolOptions): string[] {
   if (o.ssl === undefined) return [];
-  if (o.flavor === 'mysql') return [o.ssl ? '--ssl-mode=REQUIRED' : '--ssl-mode=DISABLED'];
+  if (o.flavor === 'mysql') return o.ssl ? ['--ssl-mode=REQUIRED'] : ['--ssl-mode=DISABLED', '--get-server-public-key'];
   return o.ssl ? ['--ssl', '--skip-ssl-verify-server-cert'] : ['--skip-ssl'];
 }
 
@@ -58,7 +58,7 @@ function sslArgs(o: ToolOptions): string[] {
  */
 function common(ep: Endpoint, defaultsFile: string, o: ToolOptions): string[] {
   const args = [
-    `--defaults-file=${defaultsFile}`, `--host=${ep.host}`, `--port=${ep.port}`, `--user=${ep.user}`, '--protocol=tcp', '--default-character-set=utf8mb4', ...sslArgs(o),
+    `--defaults-file=${defaultsFile}`, `--host=${ep.host}`, `--port=${ep.port}`, '--protocol=tcp', '--default-character-set=utf8mb4', ...sslArgs(o),
   ];
   if (o.flavor === 'mariadb' && o.pluginDir) args.push(`--plugin-dir=${o.pluginDir}`);
   return args;
