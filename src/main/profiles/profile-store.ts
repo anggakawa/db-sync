@@ -5,9 +5,34 @@ import type { Endpoint, Profile, ProfileInput, ProfileView, SourceEndpoint, Sync
 
 export interface Cipher { isAvailable(): boolean; encrypt(plain: string): string; decrypt(stored: string): string }
 
+/** Which sides hold a stored password that cannot be decrypted. */
+export interface UnreadablePasswords { source: boolean; target: boolean }
+export interface ProfileEntry { profile: Profile; unreadable: UnreadablePasswords }
+
+/** The stored password could not be decrypted (for example after a Windows account change). */
+export class PasswordUnreadableError extends Error {
+  constructor(readonly sides: UnreadablePasswords) {
+    const which = sides.source && sides.target ? 'source and target' : sides.source ? 'source' : 'target';
+    super(`The saved ${which} password can't be read any more. Edit this profile and enter it again.`);
+    this.name = 'PasswordUnreadableError';
+  }
+}
+
+/** profiles.json exists but cannot be read as a profile list. It is never overwritten. */
+export class ProfilesFileCorruptError extends Error {
+  constructor(readonly file: string) {
+    super(`The profiles file ${file} is damaged and cannot be read. It has not been changed. Fix or delete it, then start the app again.`);
+    this.name = 'ProfilesFileCorruptError';
+  }
+}
+
 export interface ProfileStore {
-  list(): Promise<Profile[]>; // decrypted, main process only
+  /** Decrypted, main process only. An unreadable password comes back as ''; use listEntries to tell. */
+  list(): Promise<Profile[]>;
+  listEntries(): Promise<ProfileEntry[]>;
+  /** Throws PasswordUnreadableError rather than hand out a profile with a wrong (empty) password. */
   get(id: string): Promise<Profile>;
+  getEntry(id: string): Promise<ProfileEntry>;
   save(input: ProfileInput): Promise<Profile>;
   remove(id: string): Promise<void>;
   setLastResult(id: string, outcome: SyncOutcome): Promise<void>;
@@ -39,14 +64,17 @@ export function resolveInput(input: ProfileInput, existing: Profile | null): Pro
 
 export function toView(
   p: Profile,
-  extras: { lastResult: SyncOutcome | null; hasBackup: boolean; hasUnfinishedSync: boolean }
+  extras: {
+    lastResult: SyncOutcome | null; hasBackup: boolean; hasUnfinishedSync: boolean;
+    passwordUnreadable?: UnreadablePasswords;
+  }
 ): ProfileView {
   const { password: sp, ...source } = p.source;
   const { password: tp, ...target } = p.target;
   return {
     id: p.id, name: p.name, engine: p.engine, backupEnabled: p.backupEnabled,
-    source: { ...source, hasPassword: sp !== '' },
-    target: { ...target, hasPassword: tp !== '' },
+    source: { ...source, hasPassword: sp !== '', passwordUnreadable: extras.passwordUnreadable?.source ?? false },
+    target: { ...target, hasPassword: tp !== '', passwordUnreadable: extras.passwordUnreadable?.target ?? false },
     lastResult: extras.lastResult, hasBackup: extras.hasBackup, hasUnfinishedSync: extras.hasUnfinishedSync
   };
 }
@@ -68,7 +96,17 @@ export function createProfileStore(filePath: string, cipher: Cipher): ProfileSto
       if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { profiles: [], results: {} };
       throw e;
     }
-    const data = JSON.parse(text) as Partial<FileData>;
+    let data: Partial<FileData>;
+    try {
+      data = JSON.parse(text) as Partial<FileData>;
+    } catch {
+      throw new ProfilesFileCorruptError(filePath);
+    }
+    const isObject = (v: unknown) => typeof v === 'object' && v !== null && !Array.isArray(v);
+    if (!isObject(data) || (data.profiles !== undefined && !Array.isArray(data.profiles)) ||
+        (data.results !== undefined && !isObject(data.results))) {
+      throw new ProfilesFileCorruptError(filePath);
+    }
     return { profiles: data.profiles ?? [], results: data.results ?? {} };
   }
 
@@ -89,12 +127,24 @@ export function createProfileStore(filePath: string, cipher: Cipher): ProfileSto
     if (!cipher.isAvailable()) throw new Error('Password encryption is not available on this system, so a password cannot be saved');
     return cipher.encrypt(plain);
   };
-  const dec = (stored: string): string => (stored === '' ? '' : cipher.decrypt(stored));
-  const decrypt = (p: Profile): Profile => ({
-    ...p,
-    source: { ...p.source, password: dec(p.source.password) },
-    target: { ...p.target, password: dec(p.target.password) }
-  });
+  // A password that cannot be decrypted becomes '' and is flagged, so one bad entry never hides the others.
+  const dec = (stored: string): { plain: string; unreadable: boolean } => {
+    if (stored === '') return { plain: '', unreadable: false };
+    try {
+      return { plain: cipher.decrypt(stored), unreadable: false };
+    } catch {
+      return { plain: '', unreadable: true };
+    }
+  };
+  const decryptEntry = (p: Profile): ProfileEntry => {
+    const s = dec(p.source.password);
+    const t = dec(p.target.password);
+    return {
+      profile: { ...p, source: { ...p.source, password: s.plain }, target: { ...p.target, password: t.plain } },
+      unreadable: { source: s.unreadable, target: t.unreadable }
+    };
+  };
+  const decrypt = (p: Profile): Profile => decryptEntry(p).profile;
   const encrypt = (p: Profile): Profile => ({
     ...p,
     source: { ...p.source, password: enc(p.source.password) },
@@ -103,10 +153,18 @@ export function createProfileStore(filePath: string, cipher: Cipher): ProfileSto
 
   return {
     list: () => serial(async () => (await readFile()).profiles.map(decrypt)),
+    listEntries: () => serial(async () => (await readFile()).profiles.map(decryptEntry)),
+    getEntry: (id) => serial(async () => {
+      const found = (await readFile()).profiles.find((p) => p.id === id);
+      if (!found) throw new Error(`Profile not found: ${id}`);
+      return decryptEntry(found);
+    }),
     get: (id) => serial(async () => {
       const found = (await readFile()).profiles.find((p) => p.id === id);
       if (!found) throw new Error(`Profile not found: ${id}`);
-      return decrypt(found);
+      const entry = decryptEntry(found);
+      if (entry.unreadable.source || entry.unreadable.target) throw new PasswordUnreadableError(entry.unreadable);
+      return entry.profile;
     }),
     save: (input) => serial(async () => {
       const data = await readFile();
@@ -126,6 +184,7 @@ export function createProfileStore(filePath: string, cipher: Cipher): ProfileSto
     }),
     setLastResult: (id, outcome) => serial(async () => {
       const data = await readFile();
+      if (!data.profiles.some((p) => p.id === id)) return; // removed meanwhile: do not write an orphan
       data.results[id] = outcome;
       await writeFile(data);
     }),

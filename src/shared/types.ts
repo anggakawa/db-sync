@@ -24,7 +24,8 @@ export type SyncEvent =
   | { type: 'progress'; label: string; percent: number | null }
   | { type: 'log'; line: string };
 
-type PublicEndpoint<E> = Omit<E, 'password'> & { hasPassword: boolean };
+/** `passwordUnreadable`: a password is stored but cannot be decrypted any more, so it has to be entered again. */
+type PublicEndpoint<E> = Omit<E, 'password'> & { hasPassword: boolean; passwordUnreadable: boolean };
 export interface ProfileView {
   id: string; name: string; engine: Engine; backupEnabled: boolean;
   source: PublicEndpoint<SourceEndpoint>; target: PublicEndpoint<Endpoint>;

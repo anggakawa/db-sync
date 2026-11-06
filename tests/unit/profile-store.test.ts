@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createProfileStore, toView, type Cipher } from '../../src/main/profiles/profile-store';
+import { createProfileStore, PasswordUnreadableError, toView, type Cipher } from '../../src/main/profiles/profile-store';
 import type { ProfileInput, SyncOutcome } from '../../src/shared/types';
 
 function fakeCipher(available = true): Cipher {
@@ -161,5 +161,99 @@ describe('profile store', () => {
     mutate(i);
     await expect(store.save(i)).rejects.toThrow();
     expect(await store.list()).toEqual([]);
+  });
+});
+
+describe('profile store resilience', () => {
+  const brokenFor = (bad: string): Cipher => ({
+    ...fakeCipher(),
+    decrypt: (s) => {
+      const plain = fakeCipher().decrypt(s);
+      if (plain === bad) throw new Error('Decryption failed');
+      return plain;
+    }
+  });
+
+  it('lists every profile when one password cannot be decrypted, and flags that side', async () => {
+    const store = createProfileStore(file, fakeCipher());
+    const good = input({ name: 'Good' });
+    good.source.password = 'fine';
+    good.target.password = 'fine';
+    const bad = input({ name: 'Bad' });
+    bad.target.password = 'lost-key';
+    const a = await store.save(good);
+    const b = await store.save(bad);
+    const reader = createProfileStore(file, brokenFor('lost-key'));
+    const entries = await reader.listEntries();
+    expect(entries.map((e) => e.profile.id)).toEqual([a.id, b.id]);
+    expect(entries[0].unreadable).toEqual({ source: false, target: false });
+    expect(entries[1].unreadable).toEqual({ source: false, target: true });
+    expect(entries[1].profile.target.password).toBe('');
+    expect(await reader.list()).toHaveLength(2);
+  });
+
+  it('get refuses a profile whose password cannot be decrypted, naming the sides', async () => {
+    const store = createProfileStore(file, fakeCipher());
+    const bad = input();
+    bad.source.password = 'lost-key';
+    const saved = await store.save(bad);
+    const reader = createProfileStore(file, brokenFor('lost-key'));
+    const err = await reader.get(saved.id).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PasswordUnreadableError);
+    expect((err as PasswordUnreadableError).sides).toEqual({ source: true, target: false });
+    expect((err as Error).message).toMatch(/enter it again/i);
+  });
+
+  it('toView reports passwordUnreadable per side, false by default', async () => {
+    const store = createProfileStore(file, fakeCipher());
+    const saved = await store.save(input());
+    const plain = toView(saved, { lastResult: null, hasBackup: false, hasUnfinishedSync: false });
+    expect(plain.source.passwordUnreadable).toBe(false);
+    expect(plain.target.passwordUnreadable).toBe(false);
+    const flagged = toView(saved, {
+      lastResult: null, hasBackup: false, hasUnfinishedSync: false, passwordUnreadable: { source: false, target: true }
+    });
+    expect(flagged.source.passwordUnreadable).toBe(false);
+    expect(flagged.target.passwordUnreadable).toBe(true);
+  });
+
+  it('save keeps working on a profile with an unreadable password', async () => {
+    const store = createProfileStore(file, fakeCipher());
+    const bad = input();
+    bad.target.password = 'lost-key';
+    const saved = await store.save(bad);
+    const reader = createProfileStore(file, brokenFor('lost-key'));
+    const i = input({ id: saved.id, name: 'Renamed' });
+    delete i.target.password;
+    const again = await reader.save(i);
+    expect(again.name).toBe('Renamed');
+    expect(again.target.password).toBe('');
+  });
+
+  it('names the file when profiles.json is corrupt, and does not overwrite it', async () => {
+    await fs.writeFile(file, '{ not json', 'utf8');
+    const store = createProfileStore(file, fakeCipher());
+    await expect(store.list()).rejects.toThrow(file);
+    await expect(store.save(input())).rejects.toThrow(file);
+    await expect(store.remove('x')).rejects.toThrow(file);
+    await expect(store.setLastResult('x', { status: 'cancelled', targetState: 'untouched' })).rejects.toThrow(file);
+    expect(await fs.readFile(file, 'utf8')).toBe('{ not json');
+    expect((await fs.readdir(dir)).sort()).toEqual(['profiles.json']);
+  });
+
+  it('treats a file with the wrong shape as corrupt', async () => {
+    await fs.writeFile(file, '[1,2]', 'utf8');
+    const store = createProfileStore(file, fakeCipher());
+    await expect(store.list()).rejects.toThrow(file);
+  });
+
+  it('setLastResult skips a profile that was removed instead of writing an orphan', async () => {
+    const store = createProfileStore(file, fakeCipher());
+    const a = await store.save(input());
+    await store.remove(a.id);
+    const before = await fs.readFile(file, 'utf8');
+    await store.setLastResult(a.id, { status: 'cancelled', targetState: 'untouched' });
+    expect(await fs.readFile(file, 'utf8')).toBe(before);
+    expect(await store.lastResult(a.id)).toBeNull();
   });
 });
