@@ -8,6 +8,10 @@ export const ER_DBACCESS_DENIED = 1044;
 export const ER_TABLEACCESS_DENIED = 1142;
 export const ER_SPECIFIC_ACCESS_DENIED = 1227;
 export const ER_LOCK_WAIT_TIMEOUT = 1205;
+export const ER_UNKNOWN_SYSTEM_VARIABLE = 1193;
+
+export const ED25519_MESSAGE =
+  "This MariaDB account signs in with ed25519, which DB Sync doesn't support. Use an account with a different sign-in method.";
 
 export const errnoOf = (err: unknown): number | undefined => (err as { errno?: number } | null)?.errno;
 
@@ -17,20 +21,24 @@ export const errnoOf = (err: unknown): number | undefined => (err as { errno?: n
  */
 export async function connect(ep: Endpoint, ssl: boolean): Promise<Connection> {
   requireEndpoint(ep);
-  const conn = await mysql.createConnection({
+  let conn: Connection;
+  try {
+    conn = await mysql.createConnection({
     host: ep.host, port: ep.port, user: ep.user, password: ep.password,
     ssl: ssl ? { rejectUnauthorized: false } : undefined,
     charset: 'UTF8MB4_UNICODE_CI',
     connectTimeout: 20_000,
     enableKeepAlive: true,
     keepAliveInitialDelay: 10_000,
-  });
+    });
+  } catch (err) {
+    // mysql2 has no ed25519 plugin and says so when the server asks for it.
+    const e = err as { code?: string; message?: string };
+    if (e.code === 'AUTH_SWITCH_PLUGIN_ERROR' && /ed25519/i.test(e.message ?? '')) throw new Error(ED25519_MESSAGE);
+    throw err;
+  }
   // A dropped connection must not crash the app; the next query reports it.
   conn.on('error', () => undefined);
-  try {
-    // MySQL caches table statistics for a day, which would make sizes read as zero right after a restore.
-    await conn.query('SET SESSION information_schema_stats_expiry = 0');
-  } catch { /* MariaDB has no such variable, and nothing else depends on it */ }
   return conn;
 }
 

@@ -13,17 +13,17 @@ import {
   type TargetDatabase,
 } from '../adapter';
 import { DDL_TIMEOUT_MS, requireEndpoint } from '../limits';
-import { defaultsFileContent, dumpArgs, parseServerVersion, restoreArgs, type MysqlFlavor } from './args';
+import { defaultsFileContent, dumpArgs, loginFileEnv, parseServerVersion, restoreArgs, type MysqlFlavor } from './args';
 import {
-  connect, endQuietly, ER_DBACCESS_DENIED, ER_LOCK_WAIT_TIMEOUT, ER_SPECIFIC_ACCESS_DENIED, ER_TABLEACCESS_DENIED, errnoOf,
+  connect, endQuietly, ER_DBACCESS_DENIED, ER_LOCK_WAIT_TIMEOUT, ER_SPECIFIC_ACCESS_DENIED, ER_UNKNOWN_SYSTEM_VARIABLE, ER_TABLEACCESS_DENIED, errnoOf,
   guardedQuery as q,
 } from './connection';
 import { createDefinerFilter } from './definer-filter';
 
 /** Seconds a DROP DATABASE waits for a metadata lock before it gives up. */
 const LOCK_WAIT_SECONDS = 30;
-/** Errors that mean the DROP was refused. Nothing is deleted in any of them. */
-const DROP_REFUSED = new Set([ER_LOCK_WAIT_TIMEOUT, ER_DBACCESS_DENIED, ER_SPECIFIC_ACCESS_DENIED, ER_TABLEACCESS_DENIED]);
+/** The account may not drop the database. Nothing is deleted. */
+const DROP_DENIED = new Set([ER_DBACCESS_DENIED, ER_SPECIFIC_ACCESS_DENIED, ER_TABLEACCESS_DENIED]);
 const NAME_PART = /^[A-Za-z0-9_]+$/;
 
 /** Beyond the adapter interface: what engineChecks needs from the source. */
@@ -123,7 +123,7 @@ export function createMysqlAdapter(deps: {
   }
 
   /** tool stdout, then the definer filter, then gzip, then the file. */
-  async function runDump(conn: Connection, ep: Endpoint, ssl: boolean | undefined, dest: string, label: string, ctx: StepContext) {
+  async function runDump(conn: Connection, ep: Endpoint, ssl: boolean, dest: string, label: string, ctx: StepContext) {
     // A crash can leave a file (or, from another engine, a folder) behind.
     await fs.rm(dest, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     const { flavor } = await readVersion(conn);
@@ -140,6 +140,7 @@ export function createMysqlAdapter(deps: {
           command: deps.locate.path(flavor, 'dump'),
           args: dumpArgs(ep, defaultsFile, toolOptions(flavor, ssl)),
           cwd: deps.tmpRoot,
+          env: loginFileEnv(deps.tmpRoot),
           signal: ctx.signal,
           secrets: [ep.password],
           stdout: counter,
@@ -165,20 +166,29 @@ export function createMysqlAdapter(deps: {
       const counter = new Transform({
         transform(chunk: Buffer, _encoding, callback) { read += chunk.length; report(read); callback(null, chunk); },
       });
-      const stdin = pipelineWithCallback(createReadStream(dumpPath), counter, createGunzip(), new PassThrough(), () => undefined);
+      let allRead: (done: boolean) => void = () => undefined;
+      const finished = new Promise<boolean>((resolve) => { allRead = resolve; });
+      const stdin = pipelineWithCallback(
+        createReadStream(dumpPath), counter, createGunzip(), new PassThrough(), (err) => allRead(!err),
+      );
+      let complete = false;
       try {
         await runTool({
           command: deps.locate.path(flavor, 'restore'),
-          args: restoreArgs(ep, defaultsFile, toolOptions(flavor)),
+          args: restoreArgs(ep, defaultsFile, toolOptions(flavor, false)),
           cwd: deps.tmpRoot,
+          env: loginFileEnv(deps.tmpRoot),
           signal: ctx.signal,
           secrets: [ep.password],
           stdin,
           onLine: ctx.onLog,
         });
+        // A client that exits 0 without reading everything (a \q in the dump) must not count as a restore.
+        complete = await Promise.race([finished, new Promise<boolean>((r) => setTimeout(() => r(false), 1_000))]);
       } finally {
         stdin.destroy(); // closes the dump file even when the client stopped early
       }
+      if (!complete) throw new Error('The restore stopped before the whole dump was read, so the local database is incomplete.');
       ctx.onProgress('Restoring local data', 100);
     });
   }
@@ -225,20 +235,38 @@ export function createMysqlAdapter(deps: {
     async openTarget(endpoint: Endpoint): Promise<TargetDatabase> {
       requireEndpoint(endpoint);
       const conn = await connect(endpoint, false);
+      try {
+        // MySQL caches table statistics for a day, which would make sizes read as zero right after a restore.
+        await q(conn, 'SET SESSION information_schema_stats_expiry = 0');
+      } catch (err) {
+        // MariaDB has no such variable. A timeout or a dead connection is not that, and is not swallowed.
+        if (errnoOf(err) !== ER_UNKNOWN_SYSTEM_VARIABLE) {
+          await endQuietly(conn);
+          throw err;
+        }
+      }
       const name = endpoint.database;
       const { reads, foldsCase } = readerFor(conn, name);
 
       const exists = async (signal?: AbortSignal): Promise<boolean> =>
         (await q<Row[]>(conn, 'SELECT 1 AS present FROM information_schema.schemata WHERE schema_name = ?', [name], { signal })).length > 0;
 
-      /** Database names compare without regard to case when the server says so; a processlist `db` is plain text. */
-      const clientsWhere = async (alias: string) =>
-        ((await foldsCase()) ? `LOWER(${alias}db) = LOWER(?)` : `${alias}db = ?`) + ` AND ${alias}id <> CONNECTION_ID()`;
+      /**
+       * Connections on this database. The server's own match on `db` ignores case and accents (so `cafe` also finds
+       * `café`); it only narrows the list, and the exact comparison, folded to lower case when the server folds, is here.
+       */
+      const clientsOfTarget = async (signal?: AbortSignal): Promise<Row[]> => {
+        const rows = await q<Row[]>(
+          conn,
+          'SELECT id AS id, db AS db, user AS user FROM information_schema.processlist WHERE db = ? AND id <> CONNECTION_ID()',
+          [name], { signal },
+        );
+        const folds = await foldsCase();
+        return rows.filter((r) => typeof r.db === 'string' && (folds ? r.db.toLowerCase() === name.toLowerCase() : r.db === name));
+      };
 
       const defaultKillClients = async (signal: AbortSignal): Promise<void> => {
-        const where = await clientsWhere('');
-        const rows = await q<Row[]>(conn, `SELECT id FROM information_schema.processlist WHERE ${where}`, [name], { signal });
-        for (const row of rows) {
+        for (const row of await clientsOfTarget(signal)) {
           try {
             await q(conn, `KILL ${Number(row.id)}`, [], { signal });
           } catch (err) {
@@ -250,24 +278,21 @@ export function createMysqlAdapter(deps: {
 
       const otherClients = async (): Promise<string[]> => {
         try {
-          const where = await clientsWhere('p.');
+          const rows = await clientsOfTarget();
           // The program name needs performance_schema; the user name is always there.
-          const sql = (select: string, from: string) => `SELECT DISTINCT ${select} AS app FROM ${from} WHERE ${where} ORDER BY 1`;
-          let rows: Row[];
-          try {
-            rows = await q<Row[]>(
-              conn,
-              sql(
-                'COALESCE(a.attr_value, p.user)',
-                `information_schema.processlist p LEFT JOIN performance_schema.session_connect_attrs a
-                   ON a.processlist_id = p.id AND a.attr_name = 'program_name'`,
-              ),
-              [name],
-            );
-          } catch {
-            rows = await q<Row[]>(conn, sql('p.user', 'information_schema.processlist p'), [name]);
+          const programs = new Map<number, string>();
+          if (rows.length > 0) {
+            try {
+              const attrs = await q<Row[]>(
+                conn,
+                `SELECT processlist_id AS id, attr_value AS app FROM performance_schema.session_connect_attrs
+                  WHERE attr_name = 'program_name' AND processlist_id IN (?)`,
+                [rows.map((r) => Number(r.id))],
+              );
+              for (const a of attrs) programs.set(Number(a.id), String(a.app));
+            } catch { /* performance_schema is off */ }
           }
-          const names = rows.map((r) => String(r.app || '(unnamed program)'));
+          const names = [...new Set(rows.map((r) => programs.get(Number(r.id)) ?? String(r.user || '(unnamed program)')))].sort();
           return names.length > 0 ? names : ['(unknown program)'];
         } catch {
           return ['(unknown program)'];
@@ -311,7 +336,8 @@ export function createMysqlAdapter(deps: {
           } catch (err) {
             // A lock that never freed, or a refusal for lack of privilege: the drop did not happen.
             const errno = errnoOf(err);
-            if (errno !== undefined && DROP_REFUSED.has(errno)) throw new DropBlockedError(await otherClients());
+            if (errno === ER_LOCK_WAIT_TIMEOUT) throw new DropBlockedError(await otherClients());
+            if (errno !== undefined && DROP_DENIED.has(errno)) throw new DropBlockedError([], 'permission', (err as Error).message);
             throw err;
           }
         },
@@ -321,7 +347,7 @@ export function createMysqlAdapter(deps: {
           if (options.collation) sql += ` COLLATE ${identifier(options.collation, 'collation')}`;
           await q(conn, sql, [], { timeoutMs: DDL_TIMEOUT_MS });
         },
-        dump: (destPath, ctx) => runDump(conn, endpoint, undefined, destPath, 'Backing up local data', ctx),
+        dump: (destPath, ctx) => runDump(conn, endpoint, false, destPath, 'Backing up local data', ctx),
         restore: (dumpPath, ctx) => runRestore(conn, endpoint, dumpPath, ctx),
         close: () => endQuietly(conn),
       };

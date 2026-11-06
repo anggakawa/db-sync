@@ -187,7 +187,8 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
             // 55006: a session is still connected. 42501: FORCE could not end another role's session, or the role does not
             // own the database. Either way the drop was refused and nothing was deleted.
             const code = (err as { code?: string }).code;
-            if (code === OBJECT_IN_USE || code === INSUFFICIENT_PRIVILEGE) throw new DropBlockedError(await otherClients());
+            if (code === OBJECT_IN_USE) throw new DropBlockedError(await otherClients());
+            if (code === INSUFFICIENT_PRIVILEGE) throw new DropBlockedError([], 'permission', (err as Error).message);
             throw err;
           }
         },

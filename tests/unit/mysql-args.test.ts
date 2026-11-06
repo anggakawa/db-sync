@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { defaultsFileContent, dumpArgs, parseServerVersion, restoreArgs } from '../../src/main/engines/mysql/args';
+import { defaultsFileContent, dumpArgs, loginFileEnv, parseServerVersion, restoreArgs } from '../../src/main/engines/mysql/args';
 import type { Endpoint } from '../../src/shared/types';
 
 const ep: Endpoint = { host: 'db.example.com', port: 3307, user: 'me', password: 's3cret-pw', database: 'order-db test' };
@@ -27,9 +27,9 @@ describe('defaultsFileContent', () => {
     const text = defaultsFileContent({ host: 'h', port: 1, user: 'u', password: 'x\n[mysqld]\r\ny' });
     expect(text.split('\n')).toEqual(['[client]', 'host="h"', 'port=1', 'user="u"', 'password="x\\n[mysqld]\\r\\ny"', '']);
   });
-  it('omits the password line when empty', () => {
+  it('writes an empty password explicitly so nothing else can supply one', () => {
     const text = defaultsFileContent({ host: 'h', port: 1, user: 'u', password: '' });
-    expect(text).not.toContain('password');
+    expect(text.split('\n')).toContain('password=""');
     expect(text).toContain('user="u"');
   });
 });
@@ -38,13 +38,24 @@ describe('tool arguments', () => {
   const mysql = { flavor: 'mysql' as const };
   const mariadb = { flavor: 'mariadb' as const };
 
-  it('puts --defaults-extra-file first and never includes the password', () => {
+  it('puts --defaults-file first (never --defaults-extra-file) and never includes the password', () => {
     for (const o of [mysql, mariadb, { ...mysql, ssl: true }, { ...mariadb, ssl: false, pluginDir: 'C:\\p' }]) {
       for (const args of [dumpArgs(ep, FILE, o), restoreArgs(ep, FILE, o)]) {
-        expect(args[0]).toBe(`--defaults-extra-file=${FILE}`);
+        expect(args[0]).toBe(`--defaults-file=${FILE}`);
+        expect(args.some((a) => a.startsWith('--defaults-extra-file'))).toBe(false);
         expect(args.join(' ')).not.toContain('s3cret-pw');
       }
     }
+  });
+  it('puts host, port and user on the command line so a login path cannot override them', () => {
+    for (const args of [dumpArgs(ep, FILE, mysql), restoreArgs(ep, FILE, mariadb)]) {
+      expect(args).toEqual(expect.arrayContaining(['--host=db.example.com', '--port=3307', '--user=me']));
+    }
+  });
+  it('points MYSQL_TEST_LOGIN_FILE at a file that does not exist', () => {
+    const env = loginFileEnv('C:\\tmp');
+    expect(Object.keys(env)).toEqual(['MYSQL_TEST_LOGIN_FILE']);
+    expect(env.MYSQL_TEST_LOGIN_FILE.startsWith('C:\\tmp')).toBe(true);
   });
   it('uses the required dump options', () => {
     expect(dumpArgs(ep, FILE, mysql)).toEqual(expect.arrayContaining([

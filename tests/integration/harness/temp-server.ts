@@ -107,7 +107,7 @@ function spawnDaemon(exe: string, args: string[]): { child: ChildProcess; exited
   return { child, exited };
 }
 
-async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolean): Promise<TempServer> {
+async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolean, noTls: boolean): Promise<TempServer> {
   const bin = join(REPO_ROOT, '.cache', 'servers', name, 'bin');
   const dir = await fs.mkdtemp(join(tmpdir(), `dbsync-${name}-`));
   const data = join(dir, 'data');
@@ -143,13 +143,16 @@ async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolea
       `--datadir=${data}`, `--port=${port}`, '--bind-address=127.0.0.1', `--log-error=${join(dir, 'server.log')}`,
     ];
     if (name === 'mysql') {
-      await run(mysqld, ['--initialize-insecure', `--datadir=${data}`, `--log-error=${join(dir, 'init.log')}`], 180_000);
+      await run(mysqld, ['--no-defaults', '--initialize-insecure', `--datadir=${data}`, `--log-error=${join(dir, 'init.log')}`], 180_000);
     } else {
       await run(join(bin, 'mariadb-install-db.exe'), [`--datadir=${data}`, `--port=${port}`, `--password=${rootPassword}`, '--silent'], 180_000);
     }
     const fast = ['--innodb-buffer-pool-size=64M', '--innodb-flush-log-at-trx-commit=0', '--max-connections=60'];
     const extra = name === 'mysql' ? ['--mysqlx=OFF', '--disable-log-bin'] : ['--skip-log-bin'];
-    daemon = spawnDaemon(mysqld, [...common, ...fast, ...extra]);
+    // MariaDB has no certificate configured here, so it already runs without TLS.
+    if (noTls && name === 'mysql') extra.push('--auto-generate-certs=OFF');
+    // --no-defaults first: the machine's my.ini must not change how a test server runs.
+    daemon = spawnDaemon(mysqld, ['--no-defaults', ...common, ...fast, ...extra]);
 
     const deadline = Date.now() + 90_000;
     const initialRootPassword = name === 'mysql' ? '' : rootPassword;
@@ -182,14 +185,16 @@ async function startMysqlFamily(name: 'mysql' | 'mariadb', emptyPassword: boolea
 }
 
 /** Starts a throwaway server bound to 127.0.0.1 on an OS-chosen port. Always call stop() in afterAll. */
-export async function startTempServer(name: ServerName, options: { emptyPassword?: boolean } = {}): Promise<TempServer> {
+export interface TempServerOptions { emptyPassword?: boolean; noTls?: boolean }
+
+export async function startTempServer(name: ServerName, options: TempServerOptions = {}): Promise<TempServer> {
   if (name === 'postgres' || name === 'postgres-old') return startPostgres(name, options.emptyPassword ?? false);
-  if (name === 'mysql' || name === 'mariadb') return startMysqlFamily(name, options.emptyPassword ?? false);
+  if (name === 'mysql' || name === 'mariadb') return startMysqlFamily(name, options.emptyPassword ?? false, options.noTls ?? false);
   throw new Error(`Temp ${name} servers are not available yet.`);
 }
 
 /** Starts several servers; if any fails, the ones that did start are stopped before the error is thrown. */
-export async function startTempServers(...specs: Array<[ServerName, { emptyPassword?: boolean }?]>): Promise<TempServer[]> {
+export async function startTempServers(...specs: Array<[ServerName, TempServerOptions?]>): Promise<TempServer[]> {
   const results = await Promise.allSettled(specs.map(([name, options]) => startTempServer(name, options)));
   const started = results.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []));
   const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');

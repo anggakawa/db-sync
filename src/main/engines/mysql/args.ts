@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import type { Endpoint } from '../../../shared/types';
 
 export type MysqlFlavor = 'mysql' | 'mariadb';
@@ -25,10 +26,13 @@ function quoted(value: string): string {
   return `"${escaped}"`;
 }
 
-/** The connection details, so the password never appears on a command line. The password line is left out when empty. */
+/**
+ * The password, so it never appears on a command line. It is always written, empty or not: with no value in the
+ * file nothing else may supply one. Host, port and user are written here too but also go on the command line.
+ */
 export function defaultsFileContent(e: { host: string; port: number; user: string; password: string }): string {
   const lines = ['[client]', `host=${quoted(e.host)}`, `port=${e.port}`, `user=${quoted(e.user)}`];
-  if (e.password !== '') lines.push(`password=${quoted(e.password)}`);
+  lines.push(`password=${quoted(e.password)}`);
   return `${lines.join('\n')}\n`;
 }
 
@@ -38,9 +42,15 @@ function sslArgs(o: ToolOptions): string[] {
   return o.ssl ? ['--ssl', '--skip-ssl-verify-server-cert'] : ['--skip-ssl'];
 }
 
-/** `--defaults-extra-file` has to be the first argument or the tool rejects it. */
-function common(defaultsFile: string, o: ToolOptions): string[] {
-  const args = [`--defaults-extra-file=${defaultsFile}`, '--protocol=tcp', '--default-character-set=utf8mb4', ...sslArgs(o)];
+/**
+ * `--defaults-file` has to be the first argument, and it replaces the machine's option files (my.ini), where a
+ * setting like `[mysql] force` would defeat stop-on-error. The server comes from the command line, which wins over
+ * a login path too.
+ */
+function common(ep: Endpoint, defaultsFile: string, o: ToolOptions): string[] {
+  const args = [
+    `--defaults-file=${defaultsFile}`, `--host=${ep.host}`, `--port=${ep.port}`, `--user=${ep.user}`, '--protocol=tcp', '--default-character-set=utf8mb4', ...sslArgs(o),
+  ];
   if (o.flavor === 'mariadb' && o.pluginDir) args.push(`--plugin-dir=${o.pluginDir}`);
   return args;
 }
@@ -48,7 +58,7 @@ function common(defaultsFile: string, o: ToolOptions): string[] {
 /** Never contains the password; it travels in the defaults file only. */
 export function dumpArgs(ep: Endpoint, defaultsFile: string, o: ToolOptions): string[] {
   const args = [
-    ...common(defaultsFile, o),
+    ...common(ep, defaultsFile, o),
     '--single-transaction', '--routines', '--triggers', '--events', '--hex-blob', '--no-tablespaces',
   ];
   if (o.flavor === 'mysql') args.push('--set-gtid-purged=OFF');
@@ -58,5 +68,13 @@ export function dumpArgs(ep: Endpoint, defaultsFile: string, o: ToolOptions): st
 
 /** No --force: the client stops at the first error. */
 export function restoreArgs(ep: Endpoint, defaultsFile: string, o: ToolOptions): string[] {
-  return [...common(defaultsFile, o), `--database=${ep.database}`];
+  return [...common(ep, defaultsFile, o), `--database=${ep.database}`];
+}
+
+/**
+ * MySQL clients read `%APPDATA%\MySQL\.mylogin.cnf`, whose login path would override the defaults file.
+ * Pointing MYSQL_TEST_LOGIN_FILE at a file that does not exist makes them read none.
+ */
+export function loginFileEnv(dir: string): Record<string, string> {
+  return { MYSQL_TEST_LOGIN_FILE: join(dir, 'no-such-login-file.cnf') };
 }

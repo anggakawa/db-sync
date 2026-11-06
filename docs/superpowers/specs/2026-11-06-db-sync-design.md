@@ -238,8 +238,10 @@ PostgreSQL 15 can't load this dump from dev 17. Upgrade your local image."
   - Stored with Electron `safeStorage`, which uses Windows DPAPI. If encryption
     is unavailable, the app refuses to save passwords.
   - Passed to PostgreSQL tools through `PGPASSWORD`.
-  - Passed to MySQL and MariaDB tools through a temporary `--defaults-extra-file`
-    that is deleted after use.
+  - Passed to MySQL and MariaDB tools through a temporary `--defaults-file`
+    that is deleted after use. It replaces the machine's option files (`my.ini`),
+    and the host, port and user go on the command line with a login-path file
+    disabled, so nothing on the machine can redirect the tool to another server.
   - Never passed as command-line arguments or written to logs.
 
 ### Known limits
@@ -249,6 +251,9 @@ PostgreSQL 15 can't load this dump from dev 17. Upgrade your local image."
   `kubectl port-forward`. Users must not use such a port as a target.
 - **Other local databases:** the guard does not stop a profile from overwriting
   another local database, so the confirmation dialog names the target.
+- **MariaDB ed25519:** an account that signs in with the `ed25519` plugin is not
+  supported, because the Node driver has no such plugin. DB Sync says so and asks
+  for an account with a different sign-in method.
 - **PostgreSQL roles:** roles are not copied. A row-level security policy that
   names a role missing locally fails the restore, and the failure is handled as
   described above.

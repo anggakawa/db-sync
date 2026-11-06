@@ -244,6 +244,37 @@ describe('step 4 recovery', () => {
     expect(await readJournal(paths, profile.id)).toBeNull();
   });
 
+  it('says the account may not drop the database when the refusal was about permission', async () => {
+    const refusal = new DropBlockedError([], 'permission', "Access denied for user 'limited'@'%' to database 'app'");
+    const { runner, callbacks } = setup({ failures: { 'target.dropDatabase': refusal } });
+    const out = await runner.sync(profile, callbacks());
+    expect(out).toMatchObject({ status: 'failed', step: 'replace', targetState: 'untouched' });
+    expect(out.status === 'failed' && out.message).toBe(
+      "This account isn't allowed to drop the local database: Access denied for user 'limited'@'%' to database 'app'. Nothing was deleted. Use an account that can.",
+    );
+    expect(out.status === 'failed' && out.details).toContain("Access denied for user 'limited'@'%' to database 'app'");
+    expect(out.status === 'failed' && out.message).not.toMatch(/Other programs/);
+    expect(await readJournal(paths, profile.id)).toBeNull();
+  });
+
+  it('does not claim nothing was deleted for a permission refusal after an earlier unfinished sync', async () => {
+    await writeJournal(paths, { profileId: 'p1', hadTarget: true, backupAvailable: true, startedAt: 'x', target: tgt });
+    await writeBackup();
+    const { runner, callbacks } = setup({ failures: { 'target.dropDatabase': new DropBlockedError([], 'permission', 'denied') } });
+    const out = await runner.sync(profile, callbacks());
+    expect(out).toMatchObject({ status: 'failed', targetState: 'maybe-incomplete' });
+    expect(out.status === 'failed' && out.message).toContain("isn't allowed to drop the local database: denied");
+    expect(out.status === 'failed' && out.message).not.toContain('Nothing was deleted');
+  });
+
+  it('restoreBackup() words a permission refusal the same way', async () => {
+    await writeBackup();
+    const { runner, callbacks } = setup({ failures: { 'target.dropDatabase': new DropBlockedError([], 'permission', 'denied') } });
+    const out = await runner.restoreBackup(profile, callbacks());
+    expect(out).toMatchObject({ status: 'failed', targetState: 'untouched' });
+    expect(out.status === 'failed' && out.message).toBe("This account isn't allowed to drop the local database: denied. Nothing was deleted. Use an account that can.");
+  });
+
   it('stops before deleting when the drop is blocked', async () => {
     const { fake, runner, callbacks } = setup({ failures: { 'target.dropDatabase': new DropBlockedError(['psql', 'dbeaver']) } });
     const out = await runner.sync(profile, callbacks());

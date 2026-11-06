@@ -13,12 +13,18 @@ export interface StepContext {
   onProgress(label: string, percent: number | null): void;
 }
 
+/** The drop was refused and nothing was deleted: other clients hold the database, or the account may not drop it. */
 export class DropBlockedError extends Error {
   clients: string[];
-  constructor(clients: string[], message = 'The database has other connected clients.') {
-    super(message);
+  reason: 'clients' | 'permission';
+  /** For a permission refusal, what the server said. */
+  cause: string;
+  constructor(clients: string[], reason: 'clients' | 'permission' = 'clients', cause = '') {
+    super(reason === 'permission' ? `The account may not drop the database: ${cause}` : 'The database has other connected clients.');
     this.name = 'DropBlockedError';
     this.clients = clients;
+    this.reason = reason;
+    this.cause = cause;
   }
 }
 

@@ -2,9 +2,12 @@ import { Transform, type TransformCallback } from 'node:stream';
 
 /** A quoted `user`@`host` pair, where a doubled backquote stands for a literal one. */
 const USER = '`(?:[^`]|``)*`@`(?:[^`]|``)*`';
-const CONDITIONAL_CLAUSE = new RegExp(String.raw`/\*!\d+ DEFINER=${USER}\s*\*/ ?`);
-const BEFORE_SQL_SECURITY = new RegExp(String.raw`(/\*!\d+) DEFINER=${USER} (SQL SECURITY)`);
-const CREATE_CLAUSE = new RegExp(String.raw`\bCREATE DEFINER=${USER} `);
+// Each pattern is anchored to the start of an object header line, so text inside a string, a comment or a routine body is never touched.
+const ROUTINE = new RegExp(String.raw`^CREATE DEFINER=${USER} `);
+const TRIGGER_OR_EVENT = new RegExp(String.raw`^(/\*!\d+ CREATE\*/ )/\*!\d+ DEFINER=${USER}\s*\*/ ?`);
+const VIEW = new RegExp(String.raw`^(/\*!\d+) DEFINER=${USER} (SQL SECURITY)`);
+/** MySQL writes session settings like this between DELIMITER ;; and an event. */
+const SESSION_SETTING = /^\/\*!50003 SET .*\*\/ ;;\r?$/;
 
 const INSERT_PREFIX = Buffer.from('INSERT INTO');
 const DEFINER_TEXT = Buffer.from('DEFINER=');
@@ -12,17 +15,29 @@ const NEWLINE = Buffer.from('\n');
 /** A line that is not an INSERT and grows past this is passed on unchanged; a DEFINER clause is always near its start. */
 const MAX_BUFFERED_LINE = 1024 * 1024;
 
+/** Where the line being read stands in the dump's structure. */
+type Header = 'none' | 'afterDelimiter' | 'afterViewStart';
+
 /**
- * Bytes of one line other than an INSERT. Decoded as latin1 so that every byte survives the round trip, including
- * ones that are not valid UTF-8; the patterns only match ASCII.
+ * One line other than an INSERT, with what the dump structure says about it. Only the line right after DELIMITER ;;
+ * (routine, trigger, event) or right after a view's CREATE ALGORITHM line may carry a definer. Decoded as latin1 so
+ * every byte survives the round trip, including ones that are not valid UTF-8; the patterns only match ASCII.
  */
-function filterLine(line: Buffer): Buffer {
-  if (!line.includes(DEFINER_TEXT)) return line;
-  const text = line.toString('latin1')
-    .replace(CONDITIONAL_CLAUSE, '')
-    .replace(BEFORE_SQL_SECURITY, '$1 $2')
-    .replace(CREATE_CLAUSE, 'CREATE ');
-  return Buffer.from(text, 'latin1');
+function processLine(line: Buffer, header: Header): { out: Buffer; next: Header } {
+  const text = line.toString('latin1');
+  let next: Header = 'none';
+  let edited = text;
+  if (header === 'afterDelimiter') {
+    if (SESSION_SETTING.test(text)) next = 'afterDelimiter';
+    else if (line.includes(DEFINER_TEXT)) edited = text.replace(ROUTINE, 'CREATE ').replace(TRIGGER_OR_EVENT, '$1');
+  } else if (header === 'afterViewStart' && line.includes(DEFINER_TEXT)) {
+    edited = text.replace(VIEW, '$1 $2');
+  }
+  if (next === 'none') {
+    if (text.replace(/\r$/, '') === 'DELIMITER ;;') next = 'afterDelimiter';
+    else if (text.startsWith('/*!50001 CREATE ALGORITHM')) next = 'afterViewStart';
+  }
+  return { out: edited === text ? line : Buffer.from(edited, 'latin1'), next };
 }
 
 type Mode =
@@ -41,6 +56,7 @@ export function createDefinerFilter(): Transform {
   let pendingLength = 0;
   // MariaDB writes the rows of one INSERT on separate lines. Every line of the statement is data, up to the one ending in ";".
   let insideInsert = false;
+  let header: Header = 'none';
   let lastByte = -1; // the last byte of the current INSERT line, not counting a carriage return
 
   const noteTail = (segment: Buffer): void => {
@@ -54,6 +70,7 @@ export function createDefinerFilter(): Transform {
   const endLine = (out: Buffer[], newline: boolean): void => {
     if (newline) out.push(NEWLINE);
     insideInsert = mode === 'insert' && lastByte !== 0x3b;
+    if (mode === 'insert' || mode === 'raw') header = 'none';
     lastByte = -1;
     mode = 'start';
   };
@@ -83,7 +100,9 @@ export function createDefinerFilter(): Transform {
       mode = 'other';
     }
     if (newline) {
-      out.push(filterLine(pending.length === 1 ? pending[0] : Buffer.concat(pending)));
+      const done = processLine(pending.length === 1 ? pending[0] : Buffer.concat(pending), header);
+      out.push(done.out);
+      header = done.next;
       pending = [];
       pendingLength = 0;
       endLine(out, true);
@@ -112,7 +131,7 @@ export function createDefinerFilter(): Transform {
     },
     flush(callback: TransformCallback) {
       // A last line without a newline.
-      callback(null, pending.length > 0 ? filterLine(Buffer.concat(pending)) : undefined);
+      callback(null, pending.length > 0 ? processLine(Buffer.concat(pending), header).out : undefined);
     },
   });
 }

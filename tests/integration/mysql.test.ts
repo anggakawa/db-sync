@@ -6,13 +6,13 @@ import mysql, { type Connection } from 'mysql2/promise';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { connect, guardedQuery } from '../../src/main/engines/mysql/connection';
 import { createMysqlAdapter } from '../../src/main/engines/mysql/mysql-adapter';
-import { defaultsFileContent, dumpArgs } from '../../src/main/engines/mysql/args';
+import { defaultsFileContent } from '../../src/main/engines/mysql/args';
 import { DropBlockedError, type EngineAdapter, type StepContext } from '../../src/main/engines/adapter';
 import { ToolError, runTool, type ToolRun } from '../../src/main/process/process-runner';
 import { writeJournal } from '../../src/main/sync/journal';
 import { createToolLocator } from '../../src/main/tools/tool-locator';
 import type { Endpoint, Profile, SyncEvent, SyncOutcome } from '../../src/shared/types';
-import { BUNDLED_TOOLS, startTempServers, type TempServer } from './harness/temp-server';
+import { BUNDLED_TOOLS, REPO_ROOT, startTempServer, startTempServers, type TempServer } from './harness/temp-server';
 import { createTestRunner, runSyncForTest } from './harness/sync-fixture';
 
 vi.setConfig({ testTimeout: 180_000, hookTimeout: 300_000 });
@@ -109,6 +109,9 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
       audit: await rows(c, 'SELECT * FROM audit ORDER BY id'),
       blobs: await rows(c, 'SELECT id, SHA2(data, 256) AS hash, LENGTH(data) AS len FROM blobs ORDER BY id'),
       view: await rows(c, 'SELECT * FROM order_totals ORDER BY name'),
+      notes: await rows(c, 'SELECT * FROM notes ORDER BY id'),
+      notesTable: (await rows(c, 'SHOW CREATE TABLE notes'))[0]['Create Table'],
+      noteRoutine: await rows(c, `SELECT routine_name AS n, routine_definition AS body FROM information_schema.routines WHERE routine_schema = DATABASE() AND routine_name = 'note_text'`),
       tables: await rows(c, 'SELECT table_name AS t FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY 1'),
     }), password);
 
@@ -169,6 +172,12 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
       expect(got.blobs[0]).toMatchObject({ len: 256 });
       expect(got.blobs[0].hash).toBe((await select(source, 'dev_app', 'SELECT SHA2(data, 256) AS h FROM blobs'))[0].h);
       expect(got.audit.length).toBe(3);
+      // Text that only looks like a DEFINER clause, in a default, a comment, a routine body and a row with a real newline.
+      expect(got.notes[0].body).toBe('a;\nb CREATE DEFINER=`root`@`%` y;\n);\n/*!50013 DEFINER=`a`@`b` SQL SECURITY DEFINER */');
+      expect(got.notes[0].tricky).toBe('CREATE DEFINER=`a`@`b` x');
+      expect(got.notesTable).toContain("DEFAULT 'CREATE DEFINER=`a`@`b` x'");
+      expect(got.notesTable).toContain("COMMENT='/*!1 DEFINER=`a`@`b`*/ note'");
+      expect(String(got.noteRoutine[0].body)).toContain("SET @s = 'CREATE DEFINER=`root`@`%` VIEW v AS SELECT 1'");
 
       await withClient(local, 'copy_t', async (c) => {
         await c.query('INSERT INTO orders (customer_id, total) VALUES (1, 1)');
@@ -196,7 +205,7 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
         ...(await rows(c, `SELECT definer AS d FROM information_schema.events WHERE event_schema = 'definer_t'`)),
         ...(await rows(c, `SELECT definer AS d FROM information_schema.views WHERE table_schema = 'definer_t'`)),
       ].map((r) => String(r.d)));
-      expect(owners.length).toBe(5); // two routines, a trigger, an event and a view
+      expect(owners.length).toBe(6); // three routines, a trigger, an event and a view
       expect(owners.filter((d) => d.includes('dev_owner'))).toEqual([]);
       expect(new Set(owners)).toEqual(new Set([`${local.user}@%`]));
       // The source still has its own definers.
@@ -583,7 +592,10 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
 
       const t = await adapter.openTarget(endpoint(limitedServer, 'guarded_t'));
       try {
-        await expect(t.dropDatabase(ctx())).rejects.toBeInstanceOf(DropBlockedError);
+        const err = await t.dropDatabase(ctx()).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(DropBlockedError);
+        expect(err).toMatchObject({ reason: 'permission' });
+        expect((err as DropBlockedError).cause).toMatch(/denied/i);
       } finally {
         await t.close();
       }
@@ -591,6 +603,7 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
       const profile = profileFor('dev_app', 'guarded_t', { backupEnabled: false, tgt: endpoint(limitedServer, 'guarded_t') });
       const { outcome } = await runSyncForTest(adapter, profile, rootDir);
       expect(outcome).toMatchObject({ status: 'failed', step: 'replace', targetState: 'untouched' });
+      expect(outcome.status === 'failed' && outcome.message).toMatch(/^This account isn't allowed to drop the local database: .*denied.*Nothing was deleted\. Use an account that can\.$/i);
       expect(await select(local, 'guarded_t', 'SELECT id FROM keep ORDER BY id')).toEqual([{ id: 1 }, { id: 2 }]);
       expect((await databases(local)).filter((d) => d.startsWith('__dbsync_probe_'))).toEqual([]);
       await squatter.query('SELECT 1'); // still connected
@@ -678,17 +691,6 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
         await s.close();
       }
     });
-
-    it('stops the tool when the signal aborts during a dump', async () => {
-      const s = await adapter.openSource({ ...endpoint(source, 'dev_app'), ssl: false });
-      const ac = new AbortController();
-      ac.abort();
-      try {
-        await expect(s.dump(join(workDir, `aborted-${flavor}.sql.gz`), { ...ctx(), signal: ac.signal })).rejects.toThrow(/cancel/i);
-      } finally {
-        await s.close();
-      }
-    });
   });
 
   describe('real recovery after a crash', () => {
@@ -730,36 +732,243 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
     });
   });
 
+  describe('the tools reach only the endpoint they were given', () => {
+    const mine = (run: { command: string }) => run.command.includes(flavor === 'mysql' ? 'resources\\tools\\mysql' : 'resources\\tools\\mariadb');
+
+    it('runs every tool with --defaults-file first, the endpoint on the command line and no login file', async () => {
+      await createDb(local, 'args_t', ['CREATE TABLE old (id INT)']);
+      toolRuns.length = 0;
+      expect((await runSyncForTest(adapter, profileFor('dev_app', 'args_t'), rootDir)).outcome.status).toBe('success');
+      const runs = toolRuns.filter(mine);
+      expect(runs.length).toBeGreaterThanOrEqual(3); // source dump, backup dump, restore
+      for (const run of runs) {
+        expect(run.args[0]).toMatch(/^--defaults-file=client-[0-9a-f]+\.cnf$/);
+        expect(run.args.some((a) => a.startsWith('--defaults-extra-file'))).toBe(false);
+        expect(run.args).toEqual(expect.arrayContaining([expect.stringMatching(/^--host=127\.0\.0\.1$/), expect.stringMatching(/^--port=\d+$/), expect.stringMatching(/^--user=/)]));
+        expect(run.env.MYSQL_TEST_LOGIN_FILE).toBeTruthy();
+        expect(await exists(run.env.MYSQL_TEST_LOGIN_FILE)).toBe(false);
+      }
+      // Every run with the local port is aimed at the local server, none anywhere else.
+      for (const run of runs) {
+        expect([`--port=${source.port}`, `--port=${local.port}`]).toContain(run.args.find((a) => a.startsWith('--port=')));
+      }
+    });
+
+    it.runIf(flavor === 'mysql')('ignores a .mylogin.cnf whose login path points at another server', async () => {
+      const decoy = await startTempServer('mysql', { emptyPassword: true });
+      try {
+        await createDb(decoy, 'login_t', ['CREATE TABLE decoy_marker (id INT)', 'INSERT INTO decoy_marker VALUES (99)']);
+        const decoyBefore = { dbs: await databases(decoy), marker: await select(decoy, 'login_t', 'SELECT * FROM decoy_marker'), tables: await select(decoy, 'login_t', 'SHOW TABLES') };
+
+        // A login file under a temp APPDATA, as mysql_config_editor writes it: a [client] login path naming the decoy.
+        const appData = join(workDir, 'appdata');
+        await fs.mkdir(appData, { recursive: true });
+        const editor = join(REPO_ROOT, '.cache', 'servers', 'mysql', 'bin', 'mysql_config_editor.exe');
+        const editorOut: string[] = [];
+        await runTool({
+          command: editor, args: ['set', '--login-path=client', `--host=${decoy.host}`, `--port=${decoy.port}`, `--user=${decoy.user}`],
+          env: { APPDATA: appData }, signal: new AbortController().signal, secrets: [], onLine: (l) => editorOut.push(l),
+        });
+        expect(await exists(join(appData, 'MySQL', '.mylogin.cnf')), editorOut.join('\n')).toBe(true);
+
+        // Precondition: with the options the first version used, the login path really does win.
+        await fs.mkdir(tmpRoot, { recursive: true });
+        const probe = join(tmpRoot, 'probe.cnf');
+        await fs.writeFile(probe, `[client]
+host="${local.host}"
+port=${local.port}
+`); // no user or password: those come from the login path
+        const printed: string[] = [];
+        try {
+          await runTool({
+            command: locate.path('mysql', 'restore'), cwd: tmpRoot, args: ['--defaults-extra-file=probe.cnf', '--protocol=tcp', '-N', '-e', 'SELECT @@port'],
+            env: { APPDATA: appData }, signal: new AbortController().signal, secrets: [], onLine: (l) => printed.push(l),
+          });
+        } catch (err) {
+          throw new Error(`probe failed: ${printed.join(' / ')} (${String(err)})`);
+        } finally {
+          await fs.rm(probe, { force: true });
+        }
+        expect(printed.join('\n')).toContain(String(decoy.port)); // the attack is real for --defaults-extra-file
+
+        // The sync, with that login file in place.
+        await createDb(local, 'login_t', ['CREATE TABLE real_old (id INT)']);
+        const savedAppData = process.env.APPDATA;
+        process.env.APPDATA = appData;
+        try {
+          const { outcome } = await runSyncForTest(adapter, profileFor('dev_app', 'login_t'), rootDir);
+          expect(outcome, JSON.stringify(outcome)).toMatchObject({ status: 'success' });
+        } finally {
+          if (savedAppData === undefined) delete process.env.APPDATA; else process.env.APPDATA = savedAppData;
+        }
+        expect((await snapshot(local, 'login_t')).customers.length).toBe(2); // the real target got the data
+        expect({ dbs: await databases(decoy), marker: await select(decoy, 'login_t', 'SELECT * FROM decoy_marker'), tables: await select(decoy, 'login_t', 'SHOW TABLES') })
+          .toEqual(decoyBefore); // the decoy did not change
+      } finally {
+        await decoy.stop();
+      }
+    });
+  });
+
+  describe('target servers and paths', () => {
+    it('syncs to a local server that has TLS switched off, because target tools are told not to use it', async () => {
+      const plain = await startTempServer(flavor, { noTls: true });
+      try {
+        // Without TLS on the server a client that insists on it fails, so the sync below proves the tools did not insist.
+        // (The MariaDB client only asks for TLS and carries on without it, so this check is MySQL's.)
+        if (flavor === 'mysql') {
+          await fs.mkdir(tmpRoot, { recursive: true });
+          const probe = join(tmpRoot, 'tls-probe.cnf');
+          await fs.writeFile(probe, defaultsFileContent(plain));
+          try {
+            await expect(runTool({
+              command: locate.path(flavor, 'restore'), args: [`--defaults-file=${probe}`, '--protocol=tcp', '--ssl-mode=REQUIRED', '-e', 'SELECT 1'],
+              signal: new AbortController().signal, secrets: [],
+            })).rejects.toBeInstanceOf(ToolError);
+          } finally {
+            await fs.rm(probe, { force: true });
+          }
+        }
+
+        await createDb(plain, 'tls_t', ['CREATE TABLE precious (id INT)', 'INSERT INTO precious VALUES (1)']);
+        toolRuns.length = 0;
+        const { runner, run } = createTestRunner(adapter, rootDir);
+        const profile = profileFor('dev_app', 'tls_t', { tgt: plain });
+        const { outcome } = await run((cb) => runner.sync(profile, cb));
+        expect(outcome, JSON.stringify(outcome)).toMatchObject({ status: 'success' });
+        expect((await snapshot(plain, 'tls_t')).customers.length).toBe(2);
+        const flag = flavor === 'mysql' ? '--ssl-mode=DISABLED' : '--skip-ssl';
+        const toLocal = toolRuns.filter((r) => r.args.includes(`--port=${plain.port}`));
+        expect(toLocal.length).toBe(2); // the backup dump and the restore
+        for (const r of toLocal) expect(r.args).toContain(flag);
+        // And the restore brings the backup back through the same tools.
+        const restored = await run((cb) => runner.restoreBackup(profile, cb));
+        expect(restored.outcome).toMatchObject({ status: 'success', targetState: 'restored-from-backup' });
+        expect(await select(plain, 'tls_t', 'SELECT id FROM precious')).toEqual([{ id: 1 }]);
+      } finally {
+        await plain.stop();
+      }
+    });
+
+    it('does not kill clients of a database whose name differs only by an accent', async () => {
+      await createDb(local, 'kill_cafe', ['CREATE TABLE k (id INT)']);
+      await createDb(local, 'kill_café', ['CREATE TABLE k (id INT)']);
+      const near = await connectTo(local, 'kill_café');
+      await near.query('START TRANSACTION');
+      await near.query('SELECT * FROM k');
+      const target = await connectTo(local, 'kill_cafe');
+      await target.query('START TRANSACTION');
+      await target.query('SELECT * FROM k');
+      // The server's own comparison of `db` does not tell the two names apart; that is what the adapter must correct.
+      const seen = await select(local, 'information_schema', `SELECT COUNT(*) AS n FROM information_schema.processlist WHERE db = 'kill_cafe'`);
+      expect(Number(seen[0].n)).toBeGreaterThanOrEqual(2);
+
+      const { outcome } = await runSyncForTest(adapter, profileFor('dev_app', 'kill_cafe'), rootDir);
+      expect(outcome).toMatchObject({ status: 'success' });
+      await expect(target.query('SELECT 1')).rejects.toThrow(); // the target's own client was ended
+      await expect(near.query('SELECT 1')).resolves.toBeDefined(); // the neighbour's was not
+      expect(await select(local, 'kill_café', 'SELECT COUNT(*) AS n FROM k')).toEqual([{ n: 0 }]);
+    });
+
+    // KNOWN FAILURES on the MySQL tools only (reported, not worked around; the MariaDB tools handle all of these): the tools receive their arguments in
+    // the ANSI code page, so `é` arrives as `?` and the database is not found. `it.fails` passes while this is so and
+    // starts failing the day it is fixed.
+    (flavor === 'mysql' ? it.fails : it)('works with a non-ASCII character in the source database name', async () => {
+      await createDb(source, 'dév_src', ['CREATE TABLE t (id INT)', 'INSERT INTO t VALUES (3)']);
+      await createDb(local, 'cible_plain', ['CREATE TABLE old (id INT)']);
+      const { outcome } = await runSyncForTest(adapter, profileFor('dév_src', 'cible_plain'), rootDir);
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ status: 'success' });
+      expect(await select(local, 'cible_plain', 'SELECT id FROM t')).toEqual([{ id: 3 }]);
+    });
+
+    (flavor === 'mysql' ? it.fails : it)('works with a non-ASCII character in the target database name', async () => {
+      await createDb(local, 'cible_é', ['CREATE TABLE old (id INT)']);
+      const { outcome } = await runSyncForTest(adapter, profileFor('dev_app', 'cible_é'), rootDir);
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ status: 'success' });
+      expect((await snapshot(local, 'cible_é')).customers.length).toBe(2);
+    });
+
+    it('leaves the target as it was when a non-ASCII target name makes the tools fail', async () => {
+      await createDb(local, 'garde_é', ['CREATE TABLE keep (id INT)', 'INSERT INTO keep VALUES (1)']);
+      const { outcome } = await runSyncForTest(adapter, profileFor('dev_app', 'garde_é'), rootDir);
+      if (outcome.status === 'success') return; // the day the tools handle it, the tests above start failing
+      expect(outcome.status).toBe('failed');
+      expect(await select(local, 'garde_é', 'SELECT id FROM keep')).toEqual([{ id: 1 }]);
+    });
+
+    // KNOWN FAILURE (reported): the tools turn their working folder into a path in the ANSI code page, so a defaults
+    // file under a folder with Japanese characters cannot be opened.
+    (flavor === 'mysql' ? it.fails : it)('works when the data folder has Japanese characters in its name', async () => {
+      const jaRoot = join(workDir, 'データ');
+      const jaAdapter = createMysqlAdapter({ locate, tmpRoot: join(jaRoot, 'tmp') });
+      await createDb(local, 'ja_t', ['CREATE TABLE old (id INT)']);
+      const { outcome } = await runSyncForTest(jaAdapter, profileFor('dev_app', 'ja_t'), jaRoot);
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ status: 'success' });
+      expect((await snapshot(local, 'ja_t')).customers.length).toBe(2);
+      expect((await fs.readdir(join(jaRoot, 'tmp')).catch(() => [])).filter((f) => f.endsWith('.cnf'))).toEqual([]);
+    });
+  });
+
+  describe('a dump that is cut short, and a tool that is cancelled', () => {
+    // MySQL 9.7's client answers `\q` in a batch with an error (exit 1), so only the MariaDB client can exit 0 early.
+    it.runIf(flavor === 'mariadb')('fails a restore when the client quits early with exit code 0', async () => {
+      await createDb(local, 'quit_t');
+      const s = await adapter.openSource({ ...endpoint(source, 'dev_app'), ssl: false });
+      const dump = join(workDir, `quit-${flavor}.sql.gz`);
+      try { await s.dump(dump, ctx()); } finally { await s.close(); }
+      const marker = '-- Table structure for table `orders`';
+      const text = gunzipSync(await fs.readFile(dump)).toString('utf8');
+      // \q ends the client without an error; the padding makes sure plenty of the dump is still unread.
+      const padding = '-- padding padding padding padding padding padding padding padding\n'.repeat(120_000);
+      await fs.writeFile(dump, gzipSync(text.replace(marker, () => `\\q\n${padding}${marker}`)));
+      const t = await adapter.openTarget(endpoint(local, 'quit_t'));
+      try {
+        await expect(t.restore(dump, ctx())).rejects.toThrow(/stopped before the whole dump was read/);
+      } finally {
+        await t.close();
+      }
+      const tables = (await select(local, 'quit_t', 'SELECT table_name AS t FROM information_schema.tables WHERE table_schema = DATABASE()')).map((r) => r.t);
+      expect(tables).not.toContain('orders');
+    });
+
+    it('cancels a running dump, ends the tool and removes the password file', async () => {
+      await createDb(source, 'held_src', ['CREATE TABLE t (id INT)', 'INSERT INTO t VALUES (1)']);
+      const holder = await connectTo(source, 'held_src');
+      await holder.query('LOCK TABLES t WRITE'); // the dump's read of t waits for this
+      const s = await adapter.openSource({ ...endpoint(source, 'held_src'), ssl: false });
+      const ac = new AbortController();
+      const before = toolRuns.length;
+      const started = Date.now();
+      const watcher = setInterval(() => {
+        if (toolRuns.length > before) { clearInterval(watcher); setTimeout(() => ac.abort(), 1_000); }
+      }, 5);
+      try {
+        await expect(s.dump(join(workDir, `held-${flavor}.sql.gz`), { ...ctx(), signal: ac.signal })).rejects.toThrow(/cancel/i);
+        expect(Date.now() - started).toBeLessThan(30_000);
+        expect(toolRuns.length).toBe(before + 1); // the tool really was running
+      } finally {
+        clearInterval(watcher);
+        await holder.query('UNLOCK TABLES');
+        await s.close();
+      }
+      // afterEach checks that no .cnf file is left.
+    });
+  });
+
   describe.runIf(flavor === 'mariadb')('MariaDB ed25519 authentication', () => {
-    it('lets the bundled client sign in to a user IDENTIFIED VIA ed25519', async () => {
+    it('is refused with a clear message, because the Node driver has no ed25519 plugin', async () => {
       await withClient(local, undefined, async (c) => {
         await c.query(`INSTALL SONAME 'auth_ed25519'`);
         await c.query(`CREATE USER 'edu'@'%' IDENTIFIED VIA ed25519 USING PASSWORD('ed-secret-pw')`);
         await c.query(`GRANT ALL PRIVILEGES ON *.* TO 'edu'@'%'`);
       });
-      await createDb(local, 'ed_t', ['CREATE TABLE t (id INT)', 'INSERT INTO t VALUES (5)']);
       const ep: Endpoint = { host: local.host, port: local.port, user: 'edu', password: 'ed-secret-pw', database: 'ed_t' };
-      const pluginDir = locate.pluginDir('mariadb');
-      expect(pluginDir).not.toBeNull();
-
-      await fs.mkdir(tmpRoot, { recursive: true });
-      const cnf = join(tmpRoot, 'ed25519-check.cnf');
-      await fs.writeFile(cnf, defaultsFileContent(ep));
-      const out: string[] = [];
-      try {
-        await runTool({
-          command: locate.path('mariadb', 'dump'),
-          args: dumpArgs(ep, cnf, { flavor: 'mariadb', pluginDir }),
-          signal: new AbortController().signal,
-          secrets: [ep.password],
-          onLine: (line) => out.push(line),
-        });
-      } finally {
-        await fs.rm(cnf, { force: true });
-      }
-      // The dump goes to the tool's stdout, which runTool hands to onLine when no stdout stream is given.
-      expect(out.join('\n')).toContain('CREATE TABLE `t`');
-      expect(out.join('\n')).not.toContain('ed-secret-pw');
+      const message = "This MariaDB account signs in with ed25519, which DB Sync doesn't support. Use an account with a different sign-in method.";
+      await expect(adapter.openSource({ ...ep, ssl: false })).rejects.toThrow(message);
+      await expect(adapter.openTarget(ep)).rejects.toThrow(message);
+      const err = (await adapter.openSource({ ...ep, ssl: false }).catch((e: unknown) => e)) as Error;
+      expect(err.message).toBe(message);
+      expect(err.message).not.toContain('ed-secret-pw');
     });
   });
 });

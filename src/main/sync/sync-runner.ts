@@ -45,6 +45,21 @@ const stallText = (ms: number) =>
   (ms >= 60_000 ? `${Math.round(ms / 60_000)} minute(s)` : `${Math.max(1, Math.round(ms / 1000))} second(s)`);
 const blockedMessage = (clients: string[]) =>
   `Other programs are connected to the local database (${clients.join(', ')}). Close them and try again. Nothing was deleted.`;
+const trimCause = (cause: string) => cause.replace(/[.\s]+$/, '');
+const deniedMessage = (cause: string) =>
+  `This account isn't allowed to drop the local database: ${trimCause(cause)}. Nothing was deleted. Use an account that can.`;
+const deniedPendingMessage = (cause: string) =>
+  `This account isn't allowed to drop the local database: ${trimCause(cause)}. The database may be incomplete from an earlier sync. Use an account that can, then choose Recover or sync again.`;
+/** The message and details for a refused drop; `pending` means an earlier unfinished sync left the target in doubt. */
+function refusedDrop(err: DropBlockedError, pending: boolean): { message: string; details: string } {
+  if (err.reason === 'permission') {
+    return { message: pending ? deniedPendingMessage(err.cause) : deniedMessage(err.cause), details: err.cause };
+  }
+  return {
+    message: pending ? blockedPendingMessage(err.clients) : blockedMessage(err.clients),
+    details: `Connected clients: ${err.clients.join(', ')}`,
+  };
+}
 
 const targetOf = (p: Profile): TargetId => ({ host: p.target.host, port: p.target.port, database: p.target.database });
 const mismatchMessage = (recorded: TargetId | undefined) =>
@@ -229,7 +244,7 @@ export function createSyncRunner(deps: RunnerDeps) {
         if (err instanceof StepFailure) {
           failure = { step: err.step, message: err.message, details: err.details };
         } else if (err instanceof DropBlockedError) {
-          failure = { step, message: blockedPending ? blockedPendingMessage(err.clients) : blockedMessage(err.clients), details: `Connected clients: ${err.clients.join(', ')}` };
+          failure = { step, ...refusedDrop(err, blockedPending) };
         } else {
           failure = { step, ...describeFailure(step, err, sourceInfo, targetInfo) };
         }
@@ -363,7 +378,8 @@ export function createSyncRunner(deps: RunnerDeps) {
       const targetState: TargetState = touched ? 'maybe-incomplete' : 'untouched';
       if (cb.signal.aborted) return { status: 'cancelled', targetState, ...(backupPath && { backupPath }) };
       if (err instanceof DropBlockedError) {
-        return failed(earlier ? blockedPendingMessage(err.clients) : blockedMessage(err.clients), `Connected clients: ${err.clients.join(', ')}`, targetState, backupPath);
+        const refused = refusedDrop(err, earlier !== null);
+        return failed(refused.message, refused.details, targetState, backupPath);
       }
       const d = describeFailure('replace', err, null, null, 'Choose Restore previous local data to run the restore again.');
       return failed(backupPath ? d.message : 'There is no previous local data to restore.', d.details, targetState, backupPath);
