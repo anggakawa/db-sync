@@ -1,7 +1,8 @@
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { promises as fsp } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DropBlockedError } from '../../src/main/engines/adapter';
 import { createSyncPaths, type SyncPaths } from '../../src/main/sync/paths';
 import { createSyncRunner, type RunCallbacks } from '../../src/main/sync/sync-runner';
@@ -18,7 +19,7 @@ const profile: Profile = {
 let root: string;
 let paths: SyncPaths;
 beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'runner-')); paths = createSyncPaths(root); });
-afterEach(async () => { await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.restoreAllMocks(); await rm(root, { recursive: true, force: true }); });
 
 const exists = (p: string) => stat(p).then(() => true, () => false);
 
@@ -89,8 +90,9 @@ describe('sync runner', () => {
   });
 
   it('skips the backup and the drop when the target does not exist', async () => {
-    const { fake, runner, callbacks } = setup({ targetExists: false, targetTables: [] });
+    const { fake, runner, callbacks, guardCalls } = setup({ targetExists: false, targetTables: [] });
     const out = await runner.sync(profile, callbacks());
+    expect(guardCalls).toHaveLength(2);
     expect(out).toMatchObject({ status: 'success', targetState: 'replaced' });
     expect(fake.calls).toEqual(['source.dump', 'target.createDatabase', 'target.restore']);
   });
@@ -194,6 +196,81 @@ describe('sync runner', () => {
   it('reports a failure after the drop as maybe-incomplete', async () => {
     const { runner, callbacks } = setup({ failures: { 'target.createDatabase': new Error('boom') } });
     expect(await runner.sync(profile, callbacks())).toMatchObject({ status: 'failed', step: 'replace', targetState: 'maybe-incomplete' });
+  });
+
+  it('reports a failed first-sync create as maybe-incomplete', async () => {
+    const { runner, callbacks } = setup({ targetExists: false, targetTables: [], failures: { 'target.createDatabase': new Error('x') } });
+    expect(await runner.sync(profile, callbacks())).toMatchObject({ status: 'failed', targetState: 'maybe-incomplete' });
+  });
+
+  it('reports an unexpected drop error as maybe-incomplete', async () => {
+    const { runner, callbacks } = setup({ failures: { 'target.dropDatabase': new Error('connection lost') } });
+    expect(await runner.sync(profile, callbacks())).toMatchObject({
+      status: 'failed', step: 'replace', message: 'connection lost', targetState: 'maybe-incomplete',
+    });
+  });
+
+  it('does not call the drop when cancelled right after the second guard check', async () => {
+    const ac = new AbortController();
+    let n = 0;
+    const { fake, runner, events } = setup({}, { guard: () => { if (++n === 2) ac.abort(); return { allowed: true }; } });
+    const out = await runner.sync(profile, { signal: ac.signal, onEvent: (e) => events.push(e), confirmWarnings: async () => true });
+    expect(out).toMatchObject({ status: 'cancelled', targetState: 'untouched' });
+    expect(fake.calls).not.toContain('target.dropDatabase');
+  });
+
+  it('still returns the outcome and closes both connections when removing the tmp dump fails', async () => {
+    const realRm = fsp.rm.bind(fsp);
+    vi.spyOn(fsp, 'rm').mockImplementation(async (path, opts) => {
+      if (String(path) === paths.tmpDump(profile.id)) throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+      return realRm(path, opts);
+    });
+    const { fake, runner, events, callbacks } = setup({ failures: { 'target.restore': new Error('real error') } });
+    const out = await runner.sync(profile, callbacks());
+    expect(out).toMatchObject({ status: 'failed', step: 'replace', message: 'real error' });
+    expect(fake.closes.sort()).toEqual(['source', 'target']);
+    expect(events.some((e) => e.type === 'log' && e.line.includes('busy'))).toBe(true);
+  });
+
+  it('still returns the outcome and closes the other connection when close() rejects', async () => {
+    const { fake, runner, callbacks } = setup();
+    const openSource = fake.adapter.openSource;
+    fake.adapter.openSource = async (e) => {
+      const src = await openSource(e);
+      const close = src.close;
+      src.close = async () => { await close(); throw new Error('close failed'); };
+      return src;
+    };
+    expect(await runner.sync(profile, callbacks())).toMatchObject({ status: 'success' });
+    expect(fake.closes.sort()).toEqual(['source', 'target']);
+  });
+
+  it('finishes as success with a warning when reading tables fails during verify', async () => {
+    const { fake, runner, callbacks } = setup();
+    const openTarget = fake.adapter.openTarget;
+    fake.adapter.openTarget = async (e) => {
+      const t = await openTarget(e);
+      const list = t.listTables;
+      t.listTables = async () => {
+        if (fake.calls.includes('target.restore')) throw new Error('read failed');
+        return list();
+      };
+      return t;
+    };
+    const out = await runner.sync(profile, callbacks());
+    expect(out).toMatchObject({ status: 'success', targetState: 'replaced' });
+    expect(out.status === 'success' && out.warnings).toEqual([{
+      severity: 'warning', code: 'verify-failed',
+      message: 'Could not compare tables with dev. The local copy was restored but not checked.',
+    }]);
+  });
+
+  it('finishes as success when cancelled after the restore completed', async () => {
+    const ac = new AbortController();
+    const { fake, runner, events } = setup();
+    fake.config.hooks['target.restore'] = () => { ac.abort(); };
+    const out = await runner.sync(profile, { signal: ac.signal, onEvent: (e) => events.push(e), confirmWarnings: async () => true });
+    expect(out).toMatchObject({ status: 'success', targetState: 'replaced' });
   });
 
   it('reports a blocked drop as untouched and names the clients', async () => {
