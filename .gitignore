@@ -4,3 +4,4 @@ release
 .cache
 resources/tools
 .superpowers
+test-results

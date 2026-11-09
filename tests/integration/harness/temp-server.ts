@@ -4,7 +4,6 @@ import { promises as fs } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import mysql from 'mysql2/promise';
 import { cleanEnv } from '../../../src/main/process/redact';
 
@@ -17,7 +16,8 @@ export interface TempServer {
   stop(): Promise<void>;
 }
 
-export const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+// Playwright loads this file as CommonJS, where import.meta is not allowed; every npm script runs from the repo root.
+export const REPO_ROOT = resolve(process.cwd());
 export const BUNDLED_TOOLS = resolve(REPO_ROOT, 'resources', 'tools');
 
 /** Asks the OS for a free port on loopback. */
