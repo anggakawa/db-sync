@@ -1,3 +1,5 @@
 import { createRoot } from 'react-dom/client';
+import { App } from './App';
+import './styles.css';
 
-createRoot(document.getElementById('root')!).render(<h1>DB Sync</h1>);
+createRoot(document.getElementById('root')!).render(<App />);
