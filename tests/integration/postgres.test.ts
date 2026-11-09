@@ -158,6 +158,24 @@ describe('PostgreSQL adapter', () => {
     expect(progress.some((e) => e.label === 'Reading the table list from the local database...' && e.percent === null)).toBe(true);
   });
 
+  it('ends at 100% for a database with a partitioned table', async () => {
+    await createDb(source, 'dev_part', `
+      CREATE TABLE plain (id int);
+      CREATE TABLE events (id int, day int) PARTITION BY RANGE (day);
+      CREATE TABLE events_a PARTITION OF events FOR VALUES FROM (0) TO (10);
+      CREATE TABLE events_b PARTITION OF events FOR VALUES FROM (10) TO (20);
+      INSERT INTO events VALUES (1, 1), (2, 12);`);
+    await createDb(local, 'part_t');
+    const { outcome, events } = await runSyncForTest(adapter, profileFor('dev_part', 'part_t'), rootDir);
+    expect(outcome.status).toBe('success');
+    const rows = events.flatMap((e) => (e.type === 'progress' ? [e] : []));
+    // Four relations in pg_tables, but the partitioned parent has no data of its own: three tables carry rows.
+    const last = (re: RegExp) => rows.filter((e) => re.test(e.label)).at(-1);
+    expect(last(/^Downloading from dev: \d/)).toMatchObject({ label: expect.stringMatching(/: 3 of 3 tables,/), percent: 100 });
+    expect(last(/^Restoring: \d/)).toMatchObject({ label: 'Restoring: 3 of 3 tables', percent: 100 });
+    expect(rows.some((e) => /: [4-9] of /.test(e.label))).toBe(false);
+  });
+
   it('overwrites existing target data', async () => {
     await createDb(local, 'over_t', 'CREATE TABLE local_only (id int); INSERT INTO local_only VALUES (1);');
     const { outcome } = await runSyncForTest(adapter, profileFor('dev_app', 'over_t'), rootDir);

@@ -113,3 +113,45 @@ describe('trackRestore', () => {
     expect(progress).toEqual([['Restoring: 0 of 2 tables', 0], ['Restoring: 1 of 2 tables', 50], ['Restoring: 2 of 2 tables', 100]]);
   });
 });
+
+describe('progress edge cases', () => {
+  const mk = (total: number) => {
+    const progress: Array<[string, number | null]> = [];
+    const ctx = { signal: new AbortController().signal, onLog: () => undefined, onProgress: (l: string, p: number | null) => progress.push([l, p]) };
+    return { progress, ctx, total };
+  };
+
+  it('ignores a table name that contains the phrase', () => {
+    expect(countFinishedTables([
+      'pg_dump: dumping contents of table "public.finished item 5 TABLE DATA x"',
+      'pg_dump: finished item 7 TABLE DATA finished item 5 TABLE DATA x',
+      'pg_restore: processing data for table "public.a finished item 1 TABLE DATA b"',
+    ])).toBe(1);
+  });
+
+  it('ends at 100% when fewer finished lines arrive than the total', async () => {
+    const { progress, ctx } = mk(5);
+    const t = trackDump({ prefix: 'Downloading from dev', where: 'dev', total: 5, dest: 'x', ctx, measure: async () => 0 });
+    t.onLine('pg_dump: dumping contents of table "public.a"');
+    t.onLine('pg_dump: finished item 1 TABLE DATA a');
+    expect(progress.at(-1)![1]).toBe(20);
+    await t.stop(true);
+    expect(progress.at(-1)).toEqual(['Downloading from dev: 5 of 5 tables, 0 B so far', 100]);
+  });
+
+  it('does not count past the total', () => {
+    const { progress, ctx } = mk(1);
+    const t = trackRestore(1, ctx);
+    t.onLine('pg_restore: finished item 1 TABLE DATA a');
+    t.onLine('pg_restore: finished item 2 TABLE DATA b');
+    expect(progress.at(-1)).toEqual(['Restoring: 1 of 1 tables', 100]);
+  });
+
+  it('does not report completion when stopped without final', async () => {
+    const { progress, ctx } = mk(5);
+    const t = trackDump({ prefix: 'p', where: 'dev', total: 5, dest: 'x', ctx, measure: async () => 0 });
+    t.onLine('pg_dump: dumping contents of table "public.a"');
+    await t.stop();
+    expect(progress.at(-1)![1]).toBe(0);
+  });
+});

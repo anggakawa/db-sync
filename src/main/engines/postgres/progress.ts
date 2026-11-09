@@ -3,9 +3,10 @@ import { dumpTablesLabel, readingLabel, restoreTablesLabel } from '../progress-f
 
 /**
  * pg_dump and pg_restore (--verbose) both print `finished item N TABLE DATA name` when a table's rows are done.
- * Not anchored to the `pg_restore:` prefix: with parallel workers two lines can interleave and lose it.
+ * Anchored at the line start (after an optional tool prefix), so a table name containing the phrase cannot count.
+ * The prefix may be missing: with parallel workers two lines can interleave and leave only a leading space.
  */
-const FINISHED_TABLE = /finished item \d+ TABLE DATA /;
+const FINISHED_TABLE = /^(?:pg_\w+:\s*)*\s*finished item \d+ TABLE DATA /;
 /** pg_dump prints this when it starts copying a table, which means it is done reading the database structure. */
 const DUMP_STARTED_TABLE = /dumping contents of table/;
 
@@ -23,6 +24,8 @@ export interface TableProgress {
   stop(final?: boolean): Promise<void>;
 }
 
+/** Never more than `total` when there is one. */
+const capped = (n: number, total: number): number => (total > 0 ? Math.min(n, total) : n);
 const percentOf = (done: number, total: number): number | null => (total > 0 ? Math.min(100, Math.round((done / total) * 100)) : null);
 
 /** A dump: finished tables and the folder's size, refreshed every `pollMs` so a long table does not look frozen. */
@@ -55,13 +58,14 @@ export function trackDump(opts: {
       ctx.onLog(line);
       if (stopped) return;
       if (reading && isDumpStart(line)) { reading = false; emit(); }
-      if (isFinishedTable(line)) { reading = false; done += 1; emit(); }
+      if (isFinishedTable(line)) { reading = false; done = capped(done + 1, total); emit(); }
     },
     async stop(final = false) {
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
-      if (final) { await refresh(); reading = false; emit(); }
+      // The tool succeeded, so every table is done, even those with no TABLE DATA item (extension-owned, empty partitions).
+      if (final) { await refresh(); reading = false; if (total > 0) done = total; emit(); }
     },
   };
 }
@@ -74,7 +78,7 @@ export function trackRestore(total: number, ctx: StepContext): TableProgress {
   return {
     onLine(line) {
       ctx.onLog(line);
-      if (isFinishedTable(line)) { done += 1; emit(); }
+      if (isFinishedTable(line)) { done = capped(done + 1, total); emit(); }
     },
     async stop() { /* nothing to stop */ },
   };

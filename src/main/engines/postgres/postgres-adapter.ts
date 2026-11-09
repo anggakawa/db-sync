@@ -42,6 +42,16 @@ async function readTables(client: Client): Promise<string[]> {
   return rows.map((r) => r.name).sort();
 }
 
+/** Tables that carry rows in a dump: partitioned parents (relkind 'p') hold none and have no TABLE DATA item. */
+async function countDataTables(client: Client): Promise<number> {
+  const { rows } = await q<{ n: string }>(
+    client,
+    `SELECT count(*)::text AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast_)?temp_'`,
+  );
+  return Number(rows[0].n);
+}
+
 async function readSize(client: Client): Promise<number> {
   const { rows } = await q<{ size: string }>(client, 'SELECT pg_database_size(current_database())::text AS size');
   return Number(rows[0].size);
@@ -99,7 +109,7 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
           return rows.map((r) => r.extname);
         },
         async dump(destPath, ctx) {
-          const total = (await readTables(client)).length;
+          const total = await countDataTables(client);
           await runDump(endpoint, endpoint.ssl, destPath, total, 'Downloading from dev', 'dev', ctx, (await readInfo(client)).version[0]);
         },
         close: () => endQuietly(client),
@@ -199,7 +209,7 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
           );
         },
         async dump(destPath, ctx) {
-          const total = (await target.listTables()).length;
+          const total = (await target.exists()) ? await inTarget(countDataTables) : 0;
           await runDump(endpoint, undefined, destPath, total, 'Backing up local data', 'the local database', ctx, (await readInfo(client)).version[0]);
         },
         async restore(dumpPath, ctx) {
