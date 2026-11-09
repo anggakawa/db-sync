@@ -55,7 +55,7 @@ function buildService(send: (channel: string, ...args: unknown[]) => void): Sync
     store: createProfileStore(paths.profilesFile, safeCipher),
     runner: createSyncRunner({ adapterFor, paths, checkTarget, freeDiskBytes }),
     paths,
-    logs: createLogStore(paths),
+    logs: createLogStore(paths, Date.now, app.getVersion()),
     adapterFor,
     checkTarget,
     onEvent: (id, event) => send(CHANNELS.syncEvent, id, event),

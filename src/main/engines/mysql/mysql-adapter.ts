@@ -8,6 +8,7 @@ import mysql, { type Connection } from 'mysql2/promise';
 import type { CheckIssue, Endpoint, SourceEndpoint } from '../../../shared/types';
 import { ToolError, runTool } from '../../process/process-runner';
 import type { ToolLocator } from '../../tools/tool-locator';
+import { bytesProgressLabel, restoreBytesLabel } from '../progress-format';
 import {
   DropBlockedError, type CreateOptions, type EngineAdapter, type ServerInfo, type SourceDatabase, type StepContext,
   type TargetDatabase,
@@ -128,23 +129,24 @@ export function createMysqlAdapter(deps: {
   const toolOptions = (flavor: MysqlFlavor, ssl?: boolean) => ({ flavor, ssl, pluginDir: deps.locate.pluginDir(flavor) });
 
   /** A callback for a stream's byte count that reports whole percents only when they change. */
-  function percentReporter(total: number, label: string, ctx: StepContext): (bytes: number) => void {
+  function percentReporter(total: number, labelFor: (bytes: number) => string, ctx: StepContext): (bytes: number) => void {
     let last = -1;
     return (bytes) => {
       const percent = total > 0 ? Math.min(99, Math.floor((bytes / total) * 100)) : null;
       if (percent === last) return;
       last = percent ?? -1;
-      ctx.onProgress(label, percent);
+      ctx.onProgress(labelFor(bytes), percent);
     };
   }
 
   /** tool stdout, then the definer filter, then gzip, then the file. */
-  async function runDump(conn: Connection, ep: Endpoint, ssl: boolean, dest: string, label: string, ctx: StepContext) {
+  async function runDump(conn: Connection, ep: Endpoint, ssl: boolean, dest: string, prefix: string, ctx: StepContext) {
     // A crash can leave a file (or, from another engine, a folder) behind.
     await fs.rm(dest, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     const { flavor } = await readVersion(conn);
     if (flavor === 'mysql' && hasNonAscii(ep.database)) throw new Error(unsupportedNameMessage(ep.database));
-    const report = percentReporter(await readSize(conn, ep.database), label, ctx);
+    const estimate = await readSize(conn, ep.database);
+    const report = percentReporter(estimate, (bytes) => bytesProgressLabel(prefix, bytes, estimate), ctx);
     await withDefaultsFile(ep, ctx, async (defaultsFile) => {
       let bytes = 0;
       const counter = new Transform({
@@ -169,7 +171,7 @@ export function createMysqlAdapter(deps: {
         throw err;
       }
       await written;
-      ctx.onProgress(label, 100);
+      ctx.onProgress(bytesProgressLabel(prefix, bytes, estimate), 100);
     });
   }
 
@@ -178,7 +180,7 @@ export function createMysqlAdapter(deps: {
     const { flavor } = await readVersion(conn);
     if (flavor === 'mysql' && hasNonAscii(ep.database)) throw new Error(unsupportedNameMessage(ep.database));
     const { size } = await fs.stat(dumpPath);
-    const report = percentReporter(size, 'Restoring local data', ctx);
+    const report = percentReporter(size, (bytes) => restoreBytesLabel(bytes, size), ctx);
     await withDefaultsFile(ep, ctx, async (defaultsFile) => {
       let read = 0;
       const counter = new Transform({
@@ -207,7 +209,7 @@ export function createMysqlAdapter(deps: {
         stdin.destroy(); // closes the dump file even when the client stopped early
       }
       if (!complete) throw new Error('The restore stopped before the whole dump was read, so the local database is incomplete.');
-      ctx.onProgress('Restoring local data', 100);
+      ctx.onProgress(restoreBytesLabel(read, size), 100);
     });
   }
 

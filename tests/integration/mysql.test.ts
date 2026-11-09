@@ -202,6 +202,9 @@ describe.each(FLAVORS)('%s adapter', (flavor) => {
         await expect(c.query('INSERT INTO orders (customer_id, total) VALUES (999, 1)')).rejects.toThrow(/foreign key/i);
       });
       expect(events.some((e) => e.type === 'progress' && e.percent === 100)).toBe(true);
+      const labels = events.flatMap((e) => (e.type === 'progress' ? [e.label] : []));
+      expect(labels.some((l) => /^Downloading from dev: [\d.]+ (B|KB|MB|GB) of about [\d.]+ (B|KB|MB|GB)$/.test(l))).toBe(true);
+      expect(labels.some((l) => /^Restoring: [\d.]+ (B|KB|MB|GB) of [\d.]+ (B|KB|MB|GB)$/.test(l))).toBe(true);
     });
 
     it('removes definers so a restore works without the source user', async () => {

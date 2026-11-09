@@ -8,12 +8,12 @@ import {
   type TargetDatabase,
 } from '../adapter';
 import { dumpArgs, missingExtensions, restoreArgs, toolEnv } from './args';
+import { sizeOf } from '../../sync/stall-watch';
+import { trackDump, trackRestore } from './progress';
 import { connect, DDL_TIMEOUT_MS, endQuietly, guardedQuery as q, requireEndpoint } from './connection';
 
 const OBJECT_IN_USE = '55006';
 const INSUFFICIENT_PRIVILEGE = '42501';
-const DUMP_LINE = /dumping contents of table/;
-const RESTORE_LINE = /processing data for table/;
 
 /** Beyond the adapter interface: what engineChecks needs from each side. */
 interface PostgresSource extends SourceDatabase { extensionNames(): Promise<string[]> }
@@ -58,32 +58,28 @@ async function readCreateOptions(client: Client, database?: string): Promise<Cre
   return rows[0] ? { encoding: rows[0].encoding } : {};
 }
 
-/** Counts matching tool lines and reports them as a percentage of `total` tables. */
-function progressLines(pattern: RegExp, total: number, label: string, ctx: StepContext): (line: string) => void {
-  let seen = 0;
-  return (line) => {
-    ctx.onLog(line);
-    if (!pattern.test(line)) return;
-    seen += 1;
-    ctx.onProgress(label, total > 0 ? Math.min(100, Math.round((seen / total) * 100)) : null);
-  };
-}
-
 export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: string }): EngineAdapter {
   async function runDump(
-    ep: Endpoint, ssl: boolean | undefined, dest: string, total: number, label: string, ctx: StepContext, serverMajor: number,
+    ep: Endpoint, ssl: boolean | undefined, dest: string, total: number, prefix: string, where: string, ctx: StepContext, serverMajor: number,
   ) {
     // pg_dump -Fd needs a missing or empty folder; a crash can leave one behind.
     await fs.rm(dest, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-    await runTool({
-      // The tool matching the server it dumps: a pg_dump older than its server refuses it, and a newer one writes SETs an older server rejects.
-      command: deps.locate.path('postgres', 'dump', serverMajor),
-      args: dumpArgs(ep, dest),
-      env: toolEnv(ep, ssl),
-      signal: ctx.signal,
-      secrets: [ep.password],
-      onLine: progressLines(DUMP_LINE, total, label, ctx),
-    });
+    // The size poll reads the same folder the stall watch does; it stops on every path out of the dump.
+    const progress = trackDump({ prefix, where, total, dest, ctx, measure: sizeOf });
+    try {
+      await runTool({
+        // The tool matching the server it dumps: a pg_dump older than its server refuses it, and a newer one writes SETs an older server rejects.
+        command: deps.locate.path('postgres', 'dump', serverMajor),
+        args: dumpArgs(ep, dest),
+        env: toolEnv(ep, ssl),
+        signal: ctx.signal,
+        secrets: [ep.password],
+        onLine: progress.onLine,
+      });
+      await progress.stop(true);
+    } finally {
+      await progress.stop();
+    }
   }
 
   return {
@@ -104,7 +100,7 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
         },
         async dump(destPath, ctx) {
           const total = (await readTables(client)).length;
-          await runDump(endpoint, endpoint.ssl, destPath, total, 'Downloading from dev', ctx, (await readInfo(client)).version[0]);
+          await runDump(endpoint, endpoint.ssl, destPath, total, 'Downloading from dev', 'dev', ctx, (await readInfo(client)).version[0]);
         },
         close: () => endQuietly(client),
       };
@@ -204,18 +200,19 @@ export function createPostgresAdapter(deps: { locate: ToolLocator; tmpRoot: stri
         },
         async dump(destPath, ctx) {
           const total = (await target.listTables()).length;
-          await runDump(endpoint, undefined, destPath, total, 'Backing up local data', ctx, (await readInfo(client)).version[0]);
+          await runDump(endpoint, undefined, destPath, total, 'Backing up local data', 'the local database', ctx, (await readInfo(client)).version[0]);
         },
         async restore(dumpPath, ctx) {
           const entries = await fs.readdir(dumpPath).catch(() => [] as string[]);
           const total = entries.filter((f) => /^\d+\.dat/.test(f)).length;
+          const progress = trackRestore(total, ctx);
           await runTool({
             command: deps.locate.path('postgres', 'restore', (await readInfo(client)).version[0]),
             args: restoreArgs(endpoint, dumpPath),
             env: toolEnv(endpoint),
             signal: ctx.signal,
             secrets: [endpoint.password],
-            onLine: progressLines(RESTORE_LINE, total, 'Restoring local data', ctx),
+            onLine: progress.onLine,
           });
         },
         close: () => endQuietly(client),

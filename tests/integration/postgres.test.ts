@@ -127,6 +127,37 @@ describe('PostgreSQL adapter', () => {
     expect(events.some((e) => e.type === 'progress' && e.percent === 100)).toBe(true);
   });
 
+  it('reports finished tables, size and 100% for the download, the backup and the restore', async () => {
+    await createDb(local, 'prog_t', 'CREATE TABLE local_a (id int); CREATE TABLE local_b (id int);');
+    const { outcome, events } = await runSyncForTest(adapter, profileFor('dev_app', 'prog_t'), rootDir);
+    expect(outcome.status).toBe('success');
+    const total = (await withClient(source, 'dev_app', (c) => c.query(
+      `SELECT count(*)::int AS n FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema')`,
+    ))).rows[0].n as number;
+    const progress = events.flatMap((e) => (e.type === 'progress' ? [e] : []));
+
+    const counts = (prefix: RegExp, withSize: boolean) => progress.filter((e) => prefix.test(e.label)).map((e) => {
+      const m = e.label.match(withSize
+        ? /: ([\d,]+) of ([\d,]+) tables, (\d+ B|\d+ KB|\d+\.\d MB|\d+\.\d GB) so far$/
+        : /: ([\d,]+) of ([\d,]+) tables$/);
+      expect(m, e.label).not.toBeNull();
+      return { done: Number(m![1].replaceAll(',', '')), total: Number(m![2].replaceAll(',', '')), percent: e.percent };
+    });
+    const check = (rows: ReturnType<typeof counts>, expectedTotal: number) => {
+      expect(rows.length).toBeGreaterThan(1);
+      expect(rows.every((r) => r.total === expectedTotal)).toBe(true);
+      const dones = rows.map((r) => r.done);
+      expect([...dones].sort((a, b) => a - b)).toEqual(dones); // never goes back
+      expect(dones.at(-1)).toBe(expectedTotal);
+      expect(rows.at(-1)!.percent).toBe(100);
+    };
+    check(counts(/^Downloading from dev: \d/, true), total);
+    check(counts(/^Backing up local data: \d/, true), 2);
+    check(counts(/^Restoring: \d/, false), total);
+    expect(progress.some((e) => e.label === 'Reading the table list from dev...' && e.percent === null)).toBe(true);
+    expect(progress.some((e) => e.label === 'Reading the table list from the local database...' && e.percent === null)).toBe(true);
+  });
+
   it('overwrites existing target data', async () => {
     await createDb(local, 'over_t', 'CREATE TABLE local_only (id int); INSERT INTO local_only VALUES (1);');
     const { outcome } = await runSyncForTest(adapter, profileFor('dev_app', 'over_t'), rootDir);
