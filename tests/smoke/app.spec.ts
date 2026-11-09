@@ -7,8 +7,20 @@ import { REPO_ROOT, startTempServer, type TempServer } from '../integration/harn
 
 const EXE = join(REPO_ROOT, 'release', 'win-unpacked', 'DB Sync.exe');
 
+async function tablesOf(server: TempServer, database: string): Promise<string[]> {
+  // The restore drops and recreates the database, so while it runs the connection can fail; that reads as "not there yet".
+  let c: pg.Client;
+  try { c = await connect(server, database); } catch { return ['(unavailable)']; }
+  try {
+    const r = await c.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1");
+    return r.rows.map((x: { table_name: string }) => x.table_name);
+  } catch { return ['(unavailable)']; } finally { await c.end().catch(() => undefined); }
+}
+
 async function connect(server: TempServer, database: string): Promise<pg.Client> {
-  const client = new pg.Client({ host: server.host, port: server.port, user: server.user, password: server.password, database });
+  const client = new pg.Client({ host: server.host, port: server.port, user: server.user, password: server.password, database, connectionTimeoutMillis: 5_000, query_timeout: 10_000 });
+  // A restore terminates open connections; that must not surface as an unhandled error event.
+  client.on('error', () => undefined);
   await client.connect();
   return client;
 }
@@ -64,6 +76,8 @@ test('packaged app: sync, no password on disk, restore', async () => {
     const rows = await after.query('SELECT id, label FROM items ORDER BY id');
     expect(rows.rows).toEqual([{ id: 1, label: 'from dev' }, { id: 2, label: 'also from dev' }, { id: 3, label: 'dev again' }]);
     await after.end();
+    // The sync replaced the earlier local data.
+    expect(await tablesOf(target, 'localdb')).toEqual(['items']);
 
     const profiles = await fs.readFile(join(userData, 'profiles.json'), 'utf8');
     expect(profiles).not.toContain(source.password);
@@ -73,19 +87,19 @@ test('packaged app: sync, no password on disk, restore', async () => {
     await page.getByRole('button', { name: 'Restore previous local data' }).click();
     await expect(page.getByRole('dialog')).toContainText('Restore');
     await page.getByRole('dialog').getByRole('button', { name: 'Restore', exact: true }).click();
-    await expect(page.getByText(/Done in/).first()).toBeVisible({ timeout: 120_000 });
+    // The leftover "Done in" of the sync proves nothing, so wait on the data, then on the run ending.
+    await expect.poll(() => tablesOf(target!, 'localdb'), { timeout: 120_000 }).toEqual(['old_items']);
+    await expect(page.getByRole('button', { name: 'Sync' })).toBeEnabled({ timeout: 120_000 });
+    await expect(page.getByText(/Done in/).first()).toBeVisible();
 
-    await expect.poll(async () => {
-      const c = await connect(target!, 'localdb');
-      try {
-        const r = await c.query('SELECT id, label FROM old_items ORDER BY id');
-        return r.rows;
-      } catch { return null; } finally { await c.end(); }
-    }, { timeout: 60_000 }).toEqual([{ id: 10, label: 'earlier local row' }, { id: 11, label: 'another earlier row' }]);
+    const c = await connect(target, 'localdb');
+    const old = await c.query('SELECT id, label FROM old_items ORDER BY id');
+    await c.end();
+    expect(old.rows).toEqual([{ id: 10, label: 'earlier local row' }, { id: 11, label: 'another earlier row' }]);
 
-    // Nothing sensitive or bulky is left in the working folder.
-    const left = await fs.readdir(join(userData, 'tmp')).catch(() => [] as string[]);
-    expect(left.filter((n) => /^client-.*\.cnf$/.test(n) || n.endsWith('.dump'))).toEqual([]);
+    // The app creates tmp at startup, so a missing folder is a failure.
+    const left = await fs.readdir(join(userData, 'tmp'));
+    expect(left.filter((n) => /^client-.*[.]cnf$/.test(n) || n.endsWith('.dump'))).toEqual([]);
     expect(left).toEqual([]);
   } finally {
     await app?.close().catch(() => undefined);

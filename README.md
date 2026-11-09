@@ -44,6 +44,7 @@ sides. It runs the official dump and restore tools, which are bundled in the ins
   the vendor's MD5 only. MariaDB's matches the vendor's SHA-256 list.
 - **TLS to dev does not verify certificates.** "SSL: Required" encrypts the connection
   but accepts any certificate, so it does not protect against an impersonated server.
+- **Backups and dumps on disk are unencrypted**, protected only by your Windows account.
 - **The installer is unsigned.** Windows SmartScreen warns on first install.
 - Windows x64 only. Not tested on a machine other than the development one.
 - **Real dev servers and Docker were never used in testing.** Every automated test uses
