@@ -3,7 +3,8 @@ import type { CheckIssue, ProfileView, SyncOutcome } from '../shared/types';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import type { RunState } from './components/SyncPanel';
 import { WarningsDialog } from './components/WarningsDialog';
-import { confirmRestoreText, confirmSyncText, errorMessage } from './copy';
+import { confirmRestoreText, confirmSyncText } from './copy';
+import { errorMessage, isBusyError } from './errors';
 import { ProfileEditor } from './screens/ProfileEditor';
 import { ProfileList } from './screens/ProfileList';
 
@@ -22,6 +23,8 @@ export function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const profilesRef = useRef<ProfileView[] | null>(null);
   profilesRef.current = profiles;
+  const runRef = useRef<RunState | null>(null);
+  runRef.current = run;
 
   const reload = useCallback(async () => {
     try {
@@ -49,20 +52,25 @@ export function App() {
 
   async function execute(kind: RunState['kind'], profile: ProfileView) {
     setNotice(null);
-    setResults(({ [profile.id]: _dropped, ...rest }) => rest);
+    const previousRun = runRef.current;
     setRun({ profileId: profile.id, kind, step: null, label: '', percent: null, log: [], cancelling: false });
     try {
       const api = window.dbSync;
       const outcome = kind === 'sync' ? await api.startSync(profile.id) : kind === 'restore' ? await api.restoreBackup(profile.id) : await api.recover(profile.id);
       setResults((r) => ({ ...r, [profile.id]: outcome }));
     } catch (err) {
-      // Includes "another sync is already running", which arrives as a message only.
+      if (isBusyError(err)) {
+        // Another run is live: leave its panel and its pending warnings alone.
+        setRun(previousRun);
+        setNotice(errorMessage(err));
+        return;
+      }
+      setResults(({ [profile.id]: _dropped, ...rest }) => rest);
       setNotice(errorMessage(err));
-    } finally {
-      setRun(null);
-      setWarnings(null);
-      await reload();
     }
+    setRun(null);
+    setWarnings(null);
+    await reload();
   }
 
   async function answer(accept: boolean) {
@@ -88,8 +96,11 @@ export function App() {
 
   const backToList = () => { setScreen({ name: 'list' }); void reload(); };
 
+  const dialogOpen = pending !== null || warnings !== null;
+
   return (
     <>
+      <div inert={dialogOpen}>
       {notice && (
         <div className="banner bad top-notice" role="alert">
           <span>{notice}</span>
@@ -109,6 +120,7 @@ export function App() {
       ) : (
         <ProfileEditor key={screen.id ?? 'new'} profile={editing} onSaved={backToList} onCancel={backToList} onDeleted={backToList} />
       )}
+      </div>
       {pending && (
         <ConfirmDialog
           title={pending.kind === 'sync' ? 'Overwrite local database?' : 'Restore previous local data?'}

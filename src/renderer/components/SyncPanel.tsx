@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import type { SyncOutcome, SyncStep } from '../../shared/types';
-import { outcomeText, STEP_ORDER, stepLabel } from '../copy';
+import { outcomeText, STEP_ORDER, stepLabel, visibleDetails } from '../copy';
 
 export interface RunState {
   profileId: string;
@@ -52,13 +52,9 @@ export function SyncPanel({ run, onCancel }: { run: RunState; onCancel: () => vo
 
 /** The result of the last run. While a sync is unfinished, "nothing changed" never reads as "your data is fine". */
 export function ResultNotice({ outcome, unfinished }: { outcome: SyncOutcome; unfinished: boolean }) {
-  const { title, body } = outcomeText(outcome);
+  const { title, body: text } = outcomeText(outcome, unfinished);
   const tone = outcome.status === 'success' ? 'ok' : outcome.status === 'cancelled' ? 'neutral' : 'bad';
-  const untouchedWhileUnfinished = unfinished && outcome.status !== 'success' && outcome.targetState === 'untouched';
-  const text = untouchedWhileUnfinished
-    ? `${outcome.status === 'failed' ? `${outcome.message} ` : ''}This run did not change anything. The unfinished sync above still needs recovery.`
-    : body;
-  const details = outcome.status === 'failed' ? outcome.details.trim() : '';
+  const details = outcome.status === 'failed' ? visibleDetails(outcome.details) : '';
   const warnings = outcome.status === 'success' ? outcome.warnings : [];
   return (
     <div className={`result ${tone}`} role="status">

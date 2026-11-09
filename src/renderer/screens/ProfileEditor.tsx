@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react';
 import type { ConnectionSide, ConnectionTestResult } from '../../shared/api';
 import type { Engine, ProfileInput, ProfileView } from '../../shared/types';
 import { ConfirmDialog } from '../components/ConfirmDialog';
-import { errorMessage } from '../copy';
+import { errorMessage } from '../errors';
 
 interface SideForm { host: string; port: string; user: string; password: string; noPassword: boolean; database: string }
 interface Form { name: string; engine: Engine; backupEnabled: boolean; source: SideForm & { ssl: boolean }; target: SideForm }

@@ -15,6 +15,11 @@ export interface ProfileListProps {
 
 const ENGINE_LABEL = { postgres: 'PostgreSQL', mysql: 'MySQL / MariaDB' } as const;
 
+function unreadableSides(p: ProfileView): string {
+  if (p.source.passwordUnreadable && p.target.passwordUnreadable) return 'The source and target passwords need re-entering.';
+  return p.source.passwordUnreadable ? 'The source password needs re-entering.' : 'The target password needs re-entering.';
+}
+
 export function ProfileList(props: ProfileListProps) {
   const { profiles, run } = props;
   const busy = run !== null;
@@ -59,6 +64,15 @@ export function ProfileList(props: ProfileListProps) {
                     <span> Your local database may be incomplete or missing until it is recovered.</span>
                   </div>
                   <button type="button" onClick={() => props.onRecover(p)} disabled={busy}>Recover</button>
+                </div>
+              )}
+              {(p.source.passwordUnreadable || p.target.passwordUnreadable) && (
+                <div className="banner warn" role="alert">
+                  <div>
+                    <strong>A saved password can't be read.</strong>
+                    <span> {unreadableSides(p)} Re-enter the password for this profile before syncing.</span>
+                  </div>
+                  <button type="button" onClick={() => props.onEdit(p.id)} disabled={running !== null}>Edit</button>
                 </div>
               )}
               {running ? (

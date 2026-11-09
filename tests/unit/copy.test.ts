@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { confirmRestoreText, confirmSyncText, formatDuration, outcomeText, stepLabel } from '../../src/renderer/copy';
+import { confirmRestoreText, confirmSyncText, formatDuration, outcomeText, stepLabel, visibleDetails } from '../../src/renderer/copy';
 import type { ProfileView, SyncOutcome, TargetState } from '../../src/shared/types';
 
 const view: ProfileView = {
@@ -50,5 +50,31 @@ describe('copy', () => {
   it('titles failures and cancellations', () => {
     expect(outcomeText({ status: 'cancelled', targetState: 'untouched' }).title).toBe('Sync cancelled');
     expect(outcomeText({ status: 'failed', step: 'download', message: 'x', details: '', targetState: 'untouched' }).title).toBe('Sync failed');
+  });
+});
+
+describe('copy while a sync is unfinished', () => {
+  it.each(['untouched', 'replaced', 'restored-from-backup'] as TargetState[])('never says the data is fine for %s', (targetState) => {
+    const cancelled = outcomeText({ status: 'cancelled', targetState }, true).body;
+    const failed = outcomeText({ status: 'failed', step: 'check', message: 'x.', details: '', targetState }, true).body;
+    for (const body of [cancelled, failed]) {
+      expect(body).toContain('unfinished sync above still needs recovery');
+      expect(body).not.toContain('was not changed');
+      expect(body).not.toContain('restored');
+    }
+  });
+  it('hides the replaced and restored texts for a success too', () => {
+    const body = outcomeText({ status: 'success', durationMs: 1000, warnings: [], targetState: 'replaced' }, true).body;
+    expect(body).toContain('still needs recovery');
+  });
+  it.each(['maybe-incomplete', 'removed-partial', 'recovery-failed'] as TargetState[])('keeps the %s text', (targetState) => {
+    const unfinished = outcomeText({ status: 'cancelled', targetState }, true).body;
+    expect(unfinished).toBe(outcomeText({ status: 'cancelled', targetState }, false).body);
+  });
+  it('hides a bare token in details and points to Edit', () => {
+    expect(visibleDetails('password-unreadable')).toBe('');
+    expect(visibleDetails('pg_dump: boom\nline 2')).toBe('pg_dump: boom\nline 2');
+    const o: SyncOutcome = { status: 'failed', step: 'check', message: 'Cannot read.', details: 'password-unreadable', targetState: 'untouched' };
+    expect(outcomeText(o).body).toContain('Re-enter the password for this profile.');
   });
 });

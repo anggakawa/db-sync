@@ -70,6 +70,8 @@ function createWindow(svc: SyncService): void {
   const win = new BrowserWindow({
     width: 1000,
     height: 700,
+    minWidth: 900,
+    minHeight: 640,
     webPreferences: { ...windowWebPreferences, preload: join(__dirname, '../preload/index.js') },
   });
   mainWindow = win;

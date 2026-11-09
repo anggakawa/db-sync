@@ -43,18 +43,26 @@ function stateText(state: TargetState, backupPath?: string): string {
   }
 }
 
-export function outcomeText(o: SyncOutcome): { title: string; body: string } {
-  if (o.status === 'success') {
-    return { title: `Done in ${formatDuration(o.durationMs)}`, body: stateText(o.targetState) };
-  }
-  if (o.status === 'cancelled') {
-    return { title: 'Sync cancelled', body: stateText(o.targetState, o.backupPath) };
-  }
-  return { title: 'Sync failed', body: `${o.message} ${stateText(o.targetState, o.backupPath)}` };
+const SAFE_WHILE_UNFINISHED: TargetState[] = ['maybe-incomplete', 'recovery-failed', 'removed-partial'];
+const UNFINISHED_RUN = 'This run did not change anything. The unfinished sync above still needs recovery.';
+const UNFINISHED_AFTER_RUN = 'The unfinished sync above still needs recovery before you rely on the local database.';
+
+/** A bare machine token (for example 'password-unreadable') is not for people. */
+export function visibleDetails(details: string): string {
+  const d = details.trim();
+  return /^[a-z]+(-[a-z]+)*$/.test(d) ? '' : d;
 }
 
-/** An error from the main process arrives as "Error invoking remote method '...': Error: message"; only the message is for people. */
-export function errorMessage(err: unknown): string {
-  const text = err instanceof Error ? err.message : String(err);
-  return text.replace(/^Error invoking remote method '[^']*':\s*(?:\w*Error:\s*)?/, '');
+/**
+ * While `unfinished` is true, only texts that say the local database may be damaged are shown as they are;
+ * nothing may read as "your data is fine".
+ */
+export function outcomeText(o: SyncOutcome, unfinished = false): { title: string; body: string } {
+  const title = o.status === 'success' ? `Done in ${formatDuration(o.durationMs)}` : o.status === 'cancelled' ? 'Sync cancelled' : 'Sync failed';
+  const state = stateText(o.targetState, o.status === 'success' ? undefined : o.backupPath);
+  const hide = unfinished && !SAFE_WHILE_UNFINISHED.includes(o.targetState);
+  if (o.status === 'success') return { title, body: hide ? UNFINISHED_AFTER_RUN : state };
+  if (o.status === 'cancelled') return { title, body: hide ? UNFINISHED_RUN : state };
+  const reread = o.details.trim() === 'password-unreadable' ? ' Re-enter the password for this profile.' : '';
+  return { title, body: `${o.message}${reread} ${hide ? UNFINISHED_RUN : state}` };
 }

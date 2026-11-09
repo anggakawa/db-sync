@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 
 const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
 
@@ -9,14 +9,16 @@ export function Modal({ title, onCancel, children }: { title: string; onCancel: 
   const cancelRef = useRef(onCancel);
   cancelRef.current = onCancel;
 
+  // Read during the first render: once the app behind goes inert, focus has already left it.
+  const [previous] = useState(() => document.activeElement as HTMLElement | null);
+
   useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
     const root = ref.current!;
     // Start on the safe choice: the Cancel button when there is one, else the first control.
     const first = root.querySelector<HTMLElement>('[data-initial-focus]') ?? root.querySelector<HTMLElement>(FOCUSABLE);
     (first ?? root).focus();
     return () => { previous?.focus?.(); };
-  }, []);
+  }, [previous]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancelRef.current(); return; }
@@ -31,7 +33,11 @@ export function Modal({ title, onCancel, children }: { title: string; onCancel: 
   };
 
   return (
-    <div className="backdrop">
+    <div className="backdrop" onMouseDown={(e) => {
+      if (e.target !== e.currentTarget) return;
+      e.preventDefault(); // keep the browser from moving focus to the body after the dialog has given it back
+      cancelRef.current();
+    }}>
       <div ref={ref} className="dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} onKeyDown={onKeyDown}>
         <h2 id={titleId}>{title}</h2>
         {children}
