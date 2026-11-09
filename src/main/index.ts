@@ -66,12 +66,18 @@ function buildService(send: (channel: string, ...args: unknown[]) => void): Sync
 let mainWindow: BrowserWindow | null = null;
 let service: SyncService | null = null;
 
+/** The window and taskbar icon: bundled next to the tools when packaged, in build/icons while developing. */
+function windowIcon(): string {
+  return app.isPackaged ? join(process.resourcesPath, 'icons', 'app-icon.ico') : join(app.getAppPath(), 'build', 'icons', 'app-icon.ico');
+}
+
 function createWindow(svc: SyncService): void {
   const win = new BrowserWindow({
     width: 1000,
     height: 700,
     minWidth: 900,
     minHeight: 640,
+    icon: windowIcon(),
     webPreferences: { ...windowWebPreferences, preload: join(__dirname, '../preload/index.js') },
   });
   mainWindow = win;

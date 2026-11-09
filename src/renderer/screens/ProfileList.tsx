@@ -1,4 +1,5 @@
 import type { ProfileView, SyncOutcome } from '../../shared/types';
+import { Logo } from '../components/Logo';
 import { ResultNotice, SyncPanel, type RunState } from '../components/SyncPanel';
 
 export interface ProfileListProps {
@@ -26,7 +27,7 @@ export function ProfileList(props: ProfileListProps) {
   return (
     <main className="screen">
       <header className="screen-head">
-        <h1>DB Sync</h1>
+        <h1><Logo /></h1>
         <button type="button" className="primary" onClick={props.onNew} disabled={busy}>New profile</button>
       </header>
       {profiles === null && <p className="muted">Loading profiles...</p>}

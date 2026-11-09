@@ -8,14 +8,19 @@ files:
 extraResources:
   - from: resources/tools
     to: tools
+  - from: build/icons/app-icon.ico
+    to: icons/app-icon.ico
 win:
+  icon: build/icons/app-icon.ico
   target:
     - target: nsis
       arch:
         - x64
-  signAndEditExecutable: false
+  signExecutable: false
 nsis:
   oneClick: false
   perMachine: false
   allowToChangeInstallationDirectory: true
+  installerIcon: build/icons/app-icon.ico
+  uninstallerIcon: build/icons/app-icon.ico
 publish: null

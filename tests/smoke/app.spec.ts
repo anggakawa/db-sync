@@ -53,6 +53,7 @@ test('packaged app: sync, no password on disk, restore', async () => {
     app = await electron.launch({ executablePath: EXE, env: { ...process.env, DBSYNC_USER_DATA: userData } as Record<string, string> });
     const page: Page = await app.firstWindow();
 
+    await expect(page.getByRole('heading', { name: 'DB Sync' })).toBeVisible();
     await page.getByRole('button', { name: 'New profile' }).click();
     await page.getByLabel('Profile name').fill('smoke');
     const fillSide = async (side: 'source' | 'target', server: TempServer, database: string) => {
