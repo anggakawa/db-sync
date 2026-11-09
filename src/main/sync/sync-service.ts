@@ -37,6 +37,7 @@ export interface SyncServiceDeps {
 
 export const TARGET_LOCKED_BY_JOURNAL = "Finish or recover the unfinished sync before changing this profile's target.";
 const TARGET_LOCKED_BY_RUN = "Wait for the running sync to finish before changing this profile's target.";
+const DELETE_LOCKED_BY_JOURNAL = 'Finish or recover the unfinished sync before deleting this profile.';
 const DELETE_LOCKED_BY_RUN = 'Wait for the running sync to finish before deleting this profile.';
 const CLOSING = 'DB Sync is closing. Start it again to sync.';
 
@@ -76,7 +77,7 @@ export function createSyncService(deps: SyncServiceDeps) {
       store.lastResult(id), exists(paths.backupLatest(id)), hasUnfinishedSync(id),
     ]);
     return toView(entry.profile, {
-      lastResult, hasBackup, hasUnfinishedSync: unfinished, passwordUnreadable: entry.unreadable,
+      lastResult, hasBackup, hasUnfinishedSync: unfinished, backupPath: paths.backupDir(id), passwordUnreadable: entry.unreadable,
     });
   }
 
@@ -232,14 +233,32 @@ export function createSyncService(deps: SyncServiceDeps) {
       return viewOf(await store.getEntry(saved.id));
     },
 
-    /** Deleting is allowed with an unfinished sync; the renderer asks the user to confirm first. */
+    /**
+     * Refused while a journal exists: the backup is then the only good copy of the local data.
+     * The check runs under the run lock, so no run can start and write a journal in between.
+     */
     async deleteProfile(id: string): Promise<void> {
       assertId(id);
+      if (closing) throw new Error(CLOSING);
       if (current?.profileId === id) throw new Error(DELETE_LOCKED_BY_RUN);
-      await store.remove(id);
-      const journal = paths.journal(id);
-      for (const p of [paths.backupDir(id), paths.logsDir(id), journal, `${journal}.tmp`, paths.tmpDump(id)]) {
-        await fs.rm(p, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      // With another profile's run active no run of this one can start, so only an idle service needs the lock.
+      let lock: ActiveRun | null = null;
+      let release = () => {};
+      if (!current) {
+        lock = { profileId: id, controller: new AbortController(), answer: null, done: Promise.resolve() };
+        lock.done = new Promise<void>((resolve) => { release = resolve; });
+        current = lock;
+      }
+      try {
+        if (await hasUnfinishedSync(id)) throw new Error(DELETE_LOCKED_BY_JOURNAL);
+        await store.remove(id);
+        const journal = paths.journal(id);
+        for (const p of [paths.backupDir(id), paths.logsDir(id), journal, `${journal}.tmp`, paths.tmpDump(id)]) {
+          await fs.rm(p, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        }
+      } finally {
+        if (lock && current === lock) current = null;
+        release();
       }
     },
 

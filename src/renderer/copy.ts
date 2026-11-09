@@ -6,6 +6,13 @@ export function confirmSyncText(p: ProfileView): string {
   return `Overwrite \`${p.target.database}\` on ${at(p.target)} with \`${p.source.database}\` from ${at(p.source)}?`;
 }
 
+/** What the sync confirmation says about the backup; it must match what the sync will really do. */
+export function confirmSyncNote(p: ProfileView): string {
+  if (p.hasUnfinishedSync) return 'An earlier sync did not finish, so no new backup is taken. Choose Recover first to get your previous data back.';
+  if (!p.backupEnabled) return 'Backups are off for this profile, so your local data is not backed up. If the sync fails, it cannot be put back.';
+  return 'Your current local data is backed up first, and put back if the sync fails.';
+}
+
 export function confirmRestoreText(p: ProfileView): string {
   return `Replace \`${p.target.database}\` on ${at(p.target)} with your previous local data?`;
 }
@@ -29,17 +36,23 @@ export function formatDuration(ms: number): string {
   return `${s}s`;
 }
 
-function stateText(state: TargetState, backupPath?: string): string {
+/**
+ * A failed outcome's message carries the one next step and, after a failed recovery, the backup path.
+ * Only a cancelled run has no message, so only it names a next step here.
+ */
+function stateText(state: TargetState, cancelled: boolean, backupPath: string | undefined, message: string): string {
   switch (state) {
     case 'untouched': return 'Your local database was not changed.';
     case 'replaced': return 'Your local database was replaced with the copy from dev.';
     case 'restored-from-backup': return 'Your previous local data was restored.';
     case 'removed-partial': return 'The partial local database was removed.';
-    case 'maybe-incomplete': return 'Your local database may be incomplete. Run another sync.';
-    case 'recovery-failed':
-      return backupPath
-        ? `Your local database could not be put back automatically. Your previous data is saved at ${backupPath}.`
-        : 'Your local database could not be put back automatically, and there is no backup. Run another sync.';
+    case 'maybe-incomplete':
+      if (!cancelled) return 'Your local database may be incomplete.';
+      return `Your local database may be incomplete. ${backupPath ? 'Choose Restore previous local data.' : 'Run another sync.'}`;
+    case 'recovery-failed': {
+      const saved = backupPath && !message.includes(backupPath) ? ` Your previous data is saved at ${backupPath}.` : '';
+      return `Your local database could not be put back automatically.${saved}`;
+    }
   }
 }
 
@@ -59,7 +72,9 @@ export function visibleDetails(details: string): string {
  */
 export function outcomeText(o: SyncOutcome, unfinished = false): { title: string; body: string } {
   const title = o.status === 'success' ? `Done in ${formatDuration(o.durationMs)}` : o.status === 'cancelled' ? 'Sync cancelled' : 'Sync failed';
-  const state = stateText(o.targetState, o.status === 'success' ? undefined : o.backupPath);
+  const state = stateText(
+    o.targetState, o.status === 'cancelled', o.status === 'success' ? undefined : o.backupPath, o.status === 'failed' ? o.message : '',
+  );
   const hide = unfinished && !SAFE_WHILE_UNFINISHED.includes(o.targetState);
   if (o.status === 'success') return { title, body: hide ? UNFINISHED_AFTER_RUN : state };
   if (o.status === 'cancelled') return { title, body: hide ? UNFINISHED_RUN : state };

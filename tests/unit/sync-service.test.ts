@@ -486,7 +486,9 @@ describe('profiles', () => {
     await run;
   });
 
-  it('deleting a profile removes its backup, log and journal files, even with a pending journal', async () => {
+  const REFUSED = 'Finish or recover the unfinished sync before deleting this profile.';
+
+  it('deleting a profile removes its backup and log files when no sync is unfinished', async () => {
     const r = rig();
     const id = (await r.service.saveProfile(input())).id;
     const other = (await r.service.saveProfile(input({ name: 'Other' }))).id;
@@ -494,15 +496,52 @@ describe('profiles', () => {
       await mkdir(paths.backupLatest(who), { recursive: true });
       await mkdir(paths.logsDir(who), { recursive: true });
       await writeFile(join(paths.logsDir(who), 'a.log'), 'x');
-      await pendingJournal(who);
     }
     await r.service.deleteProfile(id);
     expect(await exists(paths.backupDir(id))).toBe(false);
     expect(await exists(paths.logsDir(id))).toBe(false);
-    expect(await exists(paths.journal(id))).toBe(false);
     expect(await exists(paths.backupDir(other))).toBe(true);
-    expect(await exists(paths.journal(other))).toBe(true);
     expect((await r.service.listProfiles()).map((v) => v.id)).toEqual([other]);
+  });
+
+  it('refuses to delete a profile with an unfinished sync and leaves its backup and journal untouched', async () => {
+    const r = rig();
+    const id = (await r.service.saveProfile(input())).id;
+    await mkdir(paths.backupLatest(id), { recursive: true });
+    await writeFile(join(paths.backupLatest(id), 'data'), 'precious');
+    await mkdir(paths.logsDir(id), { recursive: true });
+    await pendingJournal(id);
+    await expect(r.service.deleteProfile(id)).rejects.toThrow(REFUSED);
+    expect(await exists(join(paths.backupLatest(id), 'data'))).toBe(true);
+    expect(await exists(paths.journal(id))).toBe(true);
+    expect(await exists(paths.logsDir(id))).toBe(true);
+    expect((await r.service.listProfiles()).map((v) => v.id)).toEqual([id]);
+  });
+
+  it('refuses to delete a profile whose journal is damaged', async () => {
+    const r = rig();
+    const id = (await r.service.saveProfile(input())).id;
+    await mkdir(join(root, 'journal'), { recursive: true });
+    await writeFile(paths.journal(id), '{ not json');
+    await expect(r.service.deleteProfile(id)).rejects.toThrow(REFUSED);
+    expect(await exists(paths.journal(id))).toBe(true);
+    expect((await r.service.listProfiles()).map((v) => v.id)).toEqual([id]);
+  });
+
+  it('blocks a run that starts while a delete is checking, so a journal cannot appear mid-delete', async () => {
+    const r = rig();
+    const id = (await r.service.saveProfile(input())).id;
+    const del = r.service.deleteProfile(id);
+    await expect(r.service.startSync(id)).rejects.toThrow(/already running/i);
+    await del;
+  });
+
+  it('puts the backup folder in the view only when a backup exists', async () => {
+    const r = rig();
+    const id = (await r.service.saveProfile(input())).id;
+    expect((await r.service.listProfiles())[0].backupPath).toBeNull();
+    await mkdir(paths.backupLatest(id), { recursive: true });
+    expect((await r.service.listProfiles())[0].backupPath).toBe(paths.backupDir(id));
   });
 
   it.each(['..', '../x', 'a/b', '', 'a b'])('rejects the unsafe profile id %j', async (bad) => {

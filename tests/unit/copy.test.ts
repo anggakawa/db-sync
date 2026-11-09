@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { confirmRestoreText, confirmSyncText, formatDuration, outcomeText, stepLabel, visibleDetails } from '../../src/renderer/copy';
+import { confirmRestoreText, confirmSyncNote, confirmSyncText, formatDuration, outcomeText, stepLabel, visibleDetails } from '../../src/renderer/copy';
 import type { ProfileView, SyncOutcome, TargetState } from '../../src/shared/types';
 
 const view: ProfileView = {
   id: 'orders', name: 'Orders', engine: 'postgres', backupEnabled: true,
   source: { host: 'dev-db', port: 5432, user: 'ro', database: 'orders', ssl: true, hasPassword: true, passwordUnreadable: false },
   target: { host: 'localhost', port: 5433, user: 'me', database: 'orders', hasPassword: true, passwordUnreadable: false },
-  lastResult: null, hasBackup: true, hasUnfinishedSync: false,
+  lastResult: null, hasBackup: true, hasUnfinishedSync: false, backupPath: 'C:\data\backups\orders',
 };
 
 describe('copy', () => {
@@ -35,7 +35,7 @@ describe('copy', () => {
     ['restored-from-backup', 'Your previous local data was restored.'],
     ['untouched', 'Your local database was not changed.'],
     ['removed-partial', 'The partial local database was removed.'],
-    ['maybe-incomplete', 'Your local database may be incomplete. Run another sync.'],
+    ['maybe-incomplete', 'Your local database may be incomplete.'],
   ] as Array<[TargetState, string]>)('explains target state %s', (targetState, text) => {
     const failed: SyncOutcome = { status: 'failed', step: 'replace', message: 'Boom.', details: '', targetState };
     expect(outcomeText(failed).body).toContain(text);

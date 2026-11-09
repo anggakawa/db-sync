@@ -14,7 +14,14 @@ sides. It runs the official dump and restore tools, which are bundled in the ins
 - Passwords are stored with Windows DPAPI (Electron `safeStorage`), are never passed
   as command-line arguments and are never written to logs.
 - The local data is backed up first (unless turned off per profile) and put back if the
-  sync fails. **Restore previous local data** brings back the last backup.
+  sync fails. **Restore previous local data** brings back the last backup. While an
+  earlier sync is unfinished no new backup is taken: choose **Recover** first.
+- **Restore previous local data is not an exact copy.** PostgreSQL backups lose owners
+  and grants (`--no-owner --no-privileges`); MySQL and MariaDB backups have `DEFINER`
+  clauses stripped.
+- A profile cannot be deleted while a sync is unfinished, because its backup may be the
+  only good copy of the local data. Recover first. Deleting a profile otherwise deletes
+  its saved backup too.
 
 ## Known limits
 

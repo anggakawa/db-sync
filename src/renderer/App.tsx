@@ -3,7 +3,7 @@ import type { CheckIssue, ProfileView, SyncOutcome } from '../shared/types';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import type { RunState } from './components/SyncPanel';
 import { WarningsDialog } from './components/WarningsDialog';
-import { confirmRestoreText, confirmSyncText } from './copy';
+import { confirmRestoreText, confirmSyncNote, confirmSyncText } from './copy';
 import { errorMessage, isBusyError } from './errors';
 import { ProfileEditor } from './screens/ProfileEditor';
 import { ProfileList } from './screens/ProfileList';
@@ -132,7 +132,7 @@ export function App() {
             ]
             : [{ label: 'Target: will be replaced', tone: 'target', database: pending.profile.target.database, where: `${pending.profile.target.host}:${pending.profile.target.port}` }]}
           note={pending.kind === 'sync'
-            ? (pending.profile.backupEnabled ? 'Your current local data is backed up first, and put back if the sync fails.' : 'Backups are off for this profile. If the sync fails, the local data cannot be put back.')
+            ? confirmSyncNote(pending.profile)
             : 'The local data as it is now is discarded.'}
           confirmLabel={pending.kind === 'sync' ? 'Overwrite' : 'Restore'}
           danger

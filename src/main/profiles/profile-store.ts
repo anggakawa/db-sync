@@ -88,6 +88,7 @@ export function toView(
   p: Profile,
   extras: {
     lastResult: SyncOutcome | null; hasBackup: boolean; hasUnfinishedSync: boolean;
+    backupPath?: string | null;
     passwordUnreadable?: UnreadablePasswords;
   }
 ): ProfileView {
@@ -97,7 +98,8 @@ export function toView(
     id: p.id, name: p.name, engine: p.engine, backupEnabled: p.backupEnabled,
     source: { ...source, hasPassword: sp !== '', passwordUnreadable: extras.passwordUnreadable?.source ?? false },
     target: { ...target, hasPassword: tp !== '', passwordUnreadable: extras.passwordUnreadable?.target ?? false },
-    lastResult: extras.lastResult, hasBackup: extras.hasBackup, hasUnfinishedSync: extras.hasUnfinishedSync
+    lastResult: extras.lastResult, hasBackup: extras.hasBackup, hasUnfinishedSync: extras.hasUnfinishedSync,
+    backupPath: extras.hasBackup ? extras.backupPath ?? null : null
   };
 }
 

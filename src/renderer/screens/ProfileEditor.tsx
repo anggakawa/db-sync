@@ -220,7 +220,9 @@ export function ProfileEditor({ profile, onSaved, onCancel, onDeleted }: {
         <ConfirmDialog
           title="Delete profile"
           message={`Delete the profile \`${profile.name}\`?`}
-          note="The databases themselves are not touched."
+          note={profile.hasBackup && profile.backupPath
+            ? `The databases themselves are not touched. The saved backup of the local data is deleted too, from ${profile.backupPath}.`
+            : 'The databases themselves are not touched.'}
           confirmLabel="Delete profile" danger onConfirm={() => void remove()} onCancel={() => setConfirmDelete(false)}
         />
       )}

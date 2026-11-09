@@ -1,7 +1,7 @@
 # DB Sync: Design
 
 **Date:** 2026-11-06
-**Status:** Awaiting review
+**Status:** Approved, implemented
 
 ## Goal
 
@@ -239,9 +239,9 @@ PostgreSQL 15 can't load this dump from dev 17. Upgrade your local image."
     is unavailable, the app refuses to save passwords.
   - Passed to PostgreSQL tools through `PGPASSWORD`.
   - Passed to MySQL and MariaDB tools through a temporary `--defaults-file`
-    that is deleted after use. It replaces the machine's option files (`my.ini`),
-    and the host, port and user go on the command line with a login-path file
-    disabled, so nothing on the machine can redirect the tool to another server.
+    that is deleted after use. The file holds the user and the password. It replaces
+    the machine's option files (`my.ini`), and the host and port go on the command
+    line with a login-path file disabled, so nothing on the machine can redirect the tool to another server.
   - Never passed as command-line arguments or written to logs.
 
 ### Known limits

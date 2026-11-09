@@ -101,6 +101,19 @@ test('packaged app: sync, no password on disk, restore', async () => {
     const left = await fs.readdir(join(userData, 'tmp'));
     expect(left.filter((n) => /^client-.*[.]cnf$/.test(n) || n.endsWith('.dump'))).toEqual([]);
     expect(left).toEqual([]);
+
+    // The sync and the restore both wrote logs; none may hold either password.
+    const logsDir = join(userData, 'logs');
+    const logFiles = (await fs.readdir(logsDir, { recursive: true })).map((n) => join(logsDir, n));
+    const secrets = [source.password, target.password];
+    let logged = 0;
+    for (const f of logFiles) {
+      if (!(await fs.stat(f)).isFile()) continue;
+      logged++;
+      const text = await fs.readFile(f, 'utf8');
+      for (const secret of secrets) expect(text, f).not.toContain(secret);
+    }
+    expect(logged).toBeGreaterThan(0);
   } finally {
     await app?.close().catch(() => undefined);
     await target?.stop().catch(() => undefined);

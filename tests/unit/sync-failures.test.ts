@@ -152,6 +152,7 @@ describe('step 4 recovery', () => {
     const { fake, runner, callbacks } = setup({ failuresOnce: { 'target.restore': new Error('boom') } });
     const out = await runner.sync({ ...profile, backupEnabled: false }, callbacks());
     expect(out).toMatchObject({ status: 'failed', targetState: 'maybe-incomplete' });
+    expect(out.status === 'failed' && out.message).toMatch(/ Run another sync.$/); // one next step, named by the message
     expect(fake.calls).toEqual(['source.dump', 'target.dropDatabase', 'target.createDatabase', 'target.restore']);
     expect(await readJournal(paths, profile.id)).not.toBeNull();
   });
@@ -401,6 +402,9 @@ describe('recover() and restoreBackup()', () => {
     const { fake, runner, callbacks } = setup({ failures: { 'target.restore': new Error('bad') } });
     const out = await runner.restoreBackup(profile, callbacks());
     expect(out).toMatchObject({ status: 'failed', targetState: 'maybe-incomplete', backupPath: paths.backupLatest(profile.id) });
+    const message = out.status === 'failed' ? out.message : '';
+    expect(message).toContain('Choose Restore previous local data');
+    expect(message).not.toContain('Run another sync');
     expect(await exists(paths.backupLatest(profile.id))).toBe(true);
     expect(fake.closes).toEqual(['target']);
   });

@@ -275,7 +275,9 @@ export function createSyncRunner(deps: RunnerDeps) {
         }
       }
       if (cancelled) return { status: 'cancelled', targetState, ...keep };
-      return { status: 'failed', ...failure!, targetState, ...keep };
+      // A blocked drop already says what to do next; any other failure that left the target in doubt gets one.
+      const next = targetState === 'maybe-incomplete' && !(err instanceof DropBlockedError) ? ' Run another sync.' : '';
+      return { status: 'failed', ...failure!, message: `${failure!.message}${next}`, targetState, ...keep };
     } finally {
       await removeQuietly(paths.tmpDump(id), ctx.onLog);
       await closeAll([source, target], ctx.onLog);

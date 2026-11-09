@@ -94,9 +94,9 @@ function createWindow(svc: SyncService): void {
       try {
         const answer = await dialog.showMessageBox(win, {
           type: 'warning',
-          title: 'Sync in progress',
-          message: 'A sync is running. Cancel it and close DB Sync?',
-          detail: 'The sync is cancelled and your local database is put back as it was before the app closes. This can take a moment.',
+          title: 'A sync or restore is running',
+          message: 'A sync or restore is running. Cancel it and close DB Sync?',
+          detail: 'Closing cancels it. If the local database was already being replaced, its backup is put back where one exists; otherwise it may be left incomplete, and the app will offer to recover next time.',
           buttons: ['Cancel sync and close', 'Keep syncing'],
           defaultId: 1,
           cancelId: 1,

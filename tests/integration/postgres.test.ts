@@ -446,13 +446,34 @@ describe('limits and refusals', () => {
     await holder.end();
   });
 
-  it('keeps passwords out of the events and failure text of a failed sync', async () => {
-    const profile = profileFor('dev_app', 'wrong_pw_t', { srcPassword: WEIRD_PASSWORD });
-    const { outcome, events } = await runSyncForTest(adapter, profile, rootDir);
-    expect(outcome.status).toBe('failed');
-    const text = outcome.status === 'failed' ? [outcome.message, outcome.details] : [];
-    expect(text.some((t) => t.includes(WEIRD_PASSWORD))).toBe(false);
-    expectNoSecret(events, WEIRD_PASSWORD);
+  it('keeps passwords out of the events and failure text of a sync that fails after connecting', async () => {
+    // Both roles really use the odd password, so the tools connect and the failure comes from pg_restore itself.
+    const alter = async (server: TempServer, from: string, to: string) =>
+      withClient(server, 'postgres', (c) => c.query(`ALTER ROLE ${c.escapeIdentifier(server.user)} PASSWORD ${c.escapeLiteral(to)}`), from);
+    // Roles are not copied, so a policy naming a role that is missing locally fails the restore.
+    await createDb(source, 'secret_fail_src', `
+      CREATE ROLE only_on_dev_t;
+      CREATE TABLE t (id int);
+      ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+      CREATE POLICY p ON t TO only_on_dev_t USING (true);`);
+    await createDb(local, 'secret_fail_t', 'CREATE TABLE old (id int);');
+    await alter(source, source.password, WEIRD_PASSWORD);
+    await alter(local, local.password, WEIRD_PASSWORD);
+    try {
+      const profile = profileFor('secret_fail_src', 'secret_fail_t', { srcPassword: WEIRD_PASSWORD, tgtPassword: WEIRD_PASSWORD, backupEnabled: false });
+      const { outcome, events } = await runSyncForTest(adapter, profile, rootDir);
+      expect(outcome.status).toBe('failed');
+      if (outcome.status !== 'failed') return;
+      // The tool ran and said something about the missing role, so there was real stderr to leak.
+      expect(`${outcome.message}
+${outcome.details}`).toMatch(/only_on_dev_t|role/i);
+      expect([outcome.message, outcome.details].some((t) => t.includes(WEIRD_PASSWORD))).toBe(false);
+      expectNoSecret(events, WEIRD_PASSWORD);
+      expect(events.some((e) => e.type === 'log' && /only_on_dev_t|role/i.test(e.line))).toBe(true);
+    } finally {
+      await alter(source, WEIRD_PASSWORD, source.password);
+      await alter(local, WEIRD_PASSWORD, local.password);
+    }
   });
 });
 

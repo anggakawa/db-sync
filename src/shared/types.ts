@@ -30,6 +30,8 @@ export interface ProfileView {
   id: string; name: string; engine: Engine; backupEnabled: boolean;
   source: PublicEndpoint<SourceEndpoint>; target: PublicEndpoint<Endpoint>;
   lastResult: SyncOutcome | null; hasBackup: boolean; hasUnfinishedSync: boolean;
+  /** The folder holding the saved backup of the local data, or null when there is none. */
+  backupPath: string | null;
 }
 export interface ProfileInput {
   id?: string; name: string; engine: Engine; backupEnabled: boolean;
